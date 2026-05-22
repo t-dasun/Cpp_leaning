@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/1_fistcpp.dir/1_fistcpp.cpp.o -o 1_fistcpp 

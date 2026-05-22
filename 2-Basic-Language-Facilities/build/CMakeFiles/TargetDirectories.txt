@@ -1,0 +1,7 @@
+/home/dasun/Documents/projects/Cpp_learining/2-Basic-Language-Facilities/build/CMakeFiles/1_fistcpp.dir
+/home/dasun/Documents/projects/Cpp_learining/2-Basic-Language-Facilities/build/CMakeFiles/2_IO.dir
+/home/dasun/Documents/projects/Cpp_learining/2-Basic-Language-Facilities/build/CMakeFiles/3_pointers.dir
+/home/dasun/Documents/projects/Cpp_learining/2-Basic-Language-Facilities/build/CMakeFiles/4_pointers.dir
+/home/dasun/Documents/projects/Cpp_learining/2-Basic-Language-Facilities/build/CMakeFiles/5_funcPointers.dir
+/home/dasun/Documents/projects/Cpp_learining/2-Basic-Language-Facilities/build/CMakeFiles/edit_cache.dir
+/home/dasun/Documents/projects/Cpp_learining/2-Basic-Language-Facilities/build/CMakeFiles/rebuild_cache.dir

@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/4_pointers.dir/4_pointers.cpp.o -o 4_pointers 

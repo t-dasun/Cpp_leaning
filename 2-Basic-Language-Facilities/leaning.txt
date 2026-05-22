@@ -1,0 +1,85 @@
+C++ Build steps
+- preprocessing (#includes processsed & macros are expanded)
+- compilation (code syntax check converted to obj)
+- linking (obj code link with std libs)
+- output the executable
+
+Primitive Types
+- Arithmatic (integral{bool,char,char16_t..},floting point(flot,double)) & void (spectial and use with pointers and functions)
+
+Modifiers (signed, unsigned, short, long) some are only for int or float
+Qualifers (const, vloatile,static) can use with all types
+-all types occupy memory diferent range and values
+
+climits <limits.h> | cfloat <float.h> for get the limits [bool use 1 byte not one bit]
+float f = 1.2345f; f is need for float, double d = 621.81
+int i // scaler type | int arr[2] // vector type
+
+Console I/O (<iostream> header)
+std::basic_ostream & std::basic_istream
+std::ostream & std::istream
+cout << & cin >>
+
+
+header file gard 
+These lines are called include guards. You use them to prevent the compiler from reading the same header file more than once.
+#ifndef MATH_H
+#define MATH_H
+//header cde initilaization of functions
+#endif
+
+In normal practice if we initialize function and its body top of main.cpp it is for inline functions
+
+//uniform Initialization (support after C++11, use this)
+int a(0) // direct initialization before c++11
+int a{0} // direct uniform initialization | int arr[8]{}
+int a = 0 // copy initilation avoid use this specially for userdefine primitive types 
+
+
+For pointers we need memory lcations but reference is reference to already exisit mem
+- reference always need to intilized, cannot be nullptr, no storage 
+- int a = 20; int &reff = a; reff =21; mean a =21
+- &a is a adress &ref is a adress ref is a value.
+- reference no need to dereference
+
+const
+- const float PI = 3.14f // always need to initilzed 
+- if the need to assign to pointer ptr should be const | const int *ptr = &PI
+- const int *ptr = &PI this only made value const not the adress, address can change, to avoide it | const int *const ptr = &PI
+- const int *ptr = &PI; ptr = &x; then *ptr=x ; but we can do *ptr = x in code
+
+// range base for loop for my class
+
+Function overloading (args type, args count, qualifiers type, but not return type (void, int))
+- compiler use name mangaling algo to make functions to make identify 
+- by generating *.map file we can see mangled names
+
+extern "C"
+- compiler directive applied for gloable funcs and vars
+- can applied only one func in set of overloaded funcs (then it will be not mangaled)
+- allow c++ functions to be called from C or other langs
+- applied for definsion (.h) and declereations (.cpp) otherwise linker error
+- extern "c" void print(int *x){}
+- can apply for mutilple functions
+extern "c" {
+int func a(){}
+int func2 b(){}
+}
+* but if u include header that applied this, in cpp no need to add extern in cpp
+
+default args in function
+- int func(int a, int b, in c = -1, d = -1) // only need in definistion  (.cpp)
+
+inline functions fast and avoid avoerhead of sunf call u can se in disassembly
+- inline int add(int a, int b) // in header file 
+- use for small funcs
+ -avois macros unless use inline funcs
+
+constexpr is when inputs are known at compile time. This calculates the result before the program even runs, // constexpr int square(int x)
+- If the function must run at runtime, the compiler treats it as inline automatically.
+
+namespace
+namespace name_of_namspace {
+    int func() {}
+    namespace name {} // second namespace
+}
