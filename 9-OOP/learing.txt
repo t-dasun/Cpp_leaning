@@ -1,0 +1,57 @@
+C++ oop
+
+cpp class can do inherit from its base class public, private, protected
+
+class A {}
+class B : public class A{}
+
+If class A don't have defult constructor, class B need to invode class A constructor in class C constructor with passing parameters by delegation and initilization class constructor
+
+if child class don't have its own private members it can get its base class constructor by,
+using A::A;
+
+chaild class can call its base class member functions
+void B::func(){ A::func();}
+
+If base clas functions will be re initilized in child , and to runtime polymorphism to work those base class member functions should be marked as virtual in header file.
+polymorphism work with bas pointer or base reference not object Base b = child() // this would not (obj slicing)
+base class also should have virual distructor
+We keep virtual table internally for these functions by compiler
+
+when we overide base class func with vitual keyword in base class func use overide in child class func it will show if function get another args then its not a overide its work as differnt  function 
+void show() override {}
+
+class Zip final{} // with final kework that class cant have child 
+function also can maked as final so that can't overide by child, even that funtion was ovrided by its base class
+
+down casting class base pointer to child
+#include <typeinfo>
+base *p = new base();
+condt std::type_info &ti = typeid(*p);
+if (ti == typeid(child1_class)){
+    child1_class *p1 = static_cast<child1_class*>(p);
+    //call p1->func()
+}
+// why we do this? if base class don't have a func that only child 1 have to get acess that we need down casting
+// above code can also do with dynamic casting 
+child1_class *p1 = dynamic_cast<child1_class*>(p);
+if (p != nullptr) {//call p1->func()}
+
+above thing can also do with reference but reference can't hold nullptr, for that we need to have exception handling to find we can downcast or not
+// avoid dynamic cast it is slower  and also avoid typeid use try yp use polymorphism its safer
+
+Abstract class 
+- cant be use as intenstation create obj but can use to point child class
+- to be abstract class there should be at least on pure vitual function (in base class )
+ vitual void func() = 0// in header | pure virtual function that optional implimetation in cpp
+- so every chid must have implimetation of that function
+ - if pure vertual funcs not derived in child that child also become pre virtual func
+
+ Diomond Inheritance
+ stream (base class)
+ InputStream : virtual public stream {} (child1) // inherit base class virtual
+ outputStream : virtual public stream {} (child2)
+ IOStram : public InputStream, public outputStream {
+    constructor of this class should invoke stream class to work this
+ }
+// reason for this virtual inheritance otherwise 2 obj are created from stream class through input and output stream class
