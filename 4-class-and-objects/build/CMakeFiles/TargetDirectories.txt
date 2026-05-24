@@ -1,0 +1,3 @@
+/home/dasun/Documents/projects/Cpp_learining/4-class-and-objects/build/CMakeFiles/1_copy.dir
+/home/dasun/Documents/projects/Cpp_learining/4-class-and-objects/build/CMakeFiles/edit_cache.dir
+/home/dasun/Documents/projects/Cpp_learining/4-class-and-objects/build/CMakeFiles/rebuild_cache.dir

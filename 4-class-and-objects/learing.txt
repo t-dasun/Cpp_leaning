@@ -1,0 +1,26 @@
+OOP 
+- Abstraction
+- Encapsulation
+- Inheritance
+    - composition (relationship between objs [has-a or part-of])
+- Polymorphism
+
+#pragma once // avoide redeclration errors
+Acess modifiers (private, public, protected)
+
+Class member var can initialize in class it fill automatically add to constructor by compiller 
+but auto can't be use in class member var initilization
+
+this pointer (can acess its own class member vars) {optional}
+this->member_var (if we have var in class and caller same name we use this or same class obj nned to pass inside its function)
+
+static var Declare at class header but initilized at cpp, otherwise get defoult val for that variable
+static var & funcs belong to thr class not to the obj [this is not working for static funcs]
+static func only can acess static members in class
+
+const functions
+if that function didn't change the state of the obj it can be const // read only funcs
+in header void func()const; cpp void class::func()const{}
+if we define obj as const then these const func only can be call for that obj
+
+shallow copy creates a new object by copying all the member field values of the original object exactly as they are. if user not define copy constructor compiler auto generate. but if pointers are there it can couse issues in runtime.

@@ -1,0 +1,75 @@
+smart pointers #include <memory>
+
+std::uinique_ptr<Integer> ptr{GetPointer(value)} // GetPointer return a pointers
+std::uinique_ptr<Integer> ptr{new Integer}
+if (ptr == nullptr) {
+    // ptr = new Integer{value}; // uinique_ptr does not allow assigning a raw pointer directly with = because that could easily create ownership problems.
+    ptr.reset(new Integer{value}); // if exisiting pinter obj is there it delete and assign this new
+}
+ptr.get()// this will return its underling pointer not the pinter obj (*p = ptr.get())
+ptr = nullptr // this works because unique_ptr has an overload for assigning nullptr. internaly same ptr.reset();
+
+Modern recommended way than [ std::unique_ptr<Integer> ptr{new Integer{value}}; ]
+auto ptr = std::make_unique<Integer>(value); ***
+std::uinique_ptr<Integer> ptr = std::make_unique<Integer>(value);
+
+uinique_ptr copy constructor is deleted so need to use std::move tp pass it to a func. but we cant use that pointers underline pointer after unless u redfine it.
+
+
+shared_ptr
+std::shared_ptr<int> p1 = std::make_shared<int>(5);
+Internally shared_ptr maintains:actual pointer, reference count (number of owners(num of functions calls that ptr obj))
+p1.use_count(); // use to find ref count for debuging (ref count maintains by control block)
+can acess *p, p->, same as raw pointers  p1.get(), p1 ==nullptr same as uinique_ptr  
+
+weak_ptr non-owning smart pointer.
+this obsever contriller ref count of the shared pointer but not owing the pointer
+Circular Reference issue 
+class B;
+
+class A {
+public:
+    std::shared_ptr<B> b;
+};
+
+class B {
+public:
+    std::shared_ptr<A> a;
+};
+if both a,b shared pointer it couse issue Both keep each other alive forever. 
+solution
+class B;
+
+class A {
+public:
+    std::shared_ptr<B> b;
+};
+
+class B {
+public:
+    std::weak_ptr<A> a;
+};
+// keep one as weak pointer so it keep observing other shared pointers controller
+weak_ptr CANNOT directly access object using: *wp , wp->x it use lock() 
+std::shared_ptr<int> sp = std::make_shared<int>(10);
+std::weak_ptr<int> wp = sp;
+auto temp = wp.lock(); //If object still exists: lock() -> shared_ptr else nullptr
+if(temp) {
+    std::cout << *temp;
+}
+//Observer pattern, Break circular references. Cache systems use this
+
+
+//deleter for smart pointers (costom deleter)
+use when smart pointer use for objects that cna't delete automaticaly (call for lagasy codes)
+function pinter deleter and obj pointer deleter 
+// add c++ code examples
+
+
+std::uinique_ptr<int[]> p{new int[5]{1,2,3,4,5}}
+c++17
+std::shared_ptr<int[]> p{new int[5]{1,2,3,4,5}}
+p[0]=10 // work
+// this will call delter it self
+avoid use this kinf of dynamic array use vector instade
+auto ptr = std::make_unique<int[]>(5) // creatd dynamic array of size 5 but without iitialization

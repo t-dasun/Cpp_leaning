@@ -41,6 +41,7 @@ For pointers we need memory lcations but reference is reference to already exisi
 - int a = 20; int &reff = a; reff =21; mean a =21
 - &a is a adress &ref is a adress ref is a value.
 - reference no need to dereference
+- reference cannot reassign
 
 const
 - const float PI = 3.14f // always need to initilzed 

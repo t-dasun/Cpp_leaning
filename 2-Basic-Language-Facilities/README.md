@@ -36,8 +36,8 @@ The C++ build process consists of **4 steps**:
 |----------|-------|
 | `signed/unsigned` | Affects range of values |
 | `short/long` | Affects size in memory |
-| `const` | Value cannot be modified |
-| `static` | Internal linkage |
+| `const` | Value cannot be modified through that name |
+| `static` | Gives local variables static storage duration; at namespace scope gives internal linkage |
 
 ### Memory & Limits
 ```cpp
@@ -52,7 +52,7 @@ double d = 3.14;     // Default for decimal
 ```cpp
 int a(0);        // Direct (before C++11)
 int a{0};        // Uniform (C++11+) ✓ Recommended
-int a = 0;       // Copy (avoid for user-defined types)
+int a = 0;       // Copy initialization
 int arr[8]{};    // Initialize array with zeros
 ```
 
@@ -121,10 +121,12 @@ ref = 21;                // Changes a to 21
 | Can be null | ✓ | ✗ |
 | Can reassign | ✓ | ✗ |
 | Dereferencing | Required (`*ptr`) | Not needed |
-| Storage | Yes | No |
+| Object identity | Separate pointer object | Alias to another object |
 
 ### Pointers with Arrays
 ```cpp
+#include <iterator>
+
 int arr[] = {1, 2, 3, 4, 5};
 int *beg = std::begin(arr);
 int *end = std::end(arr);
@@ -161,6 +163,8 @@ int main() {
 
 ### With `atexit()`
 ```cpp
+#include <cstdlib>
+
 void EndMessage() {
     std::cout << "Program ending" << std::endl;
 }
@@ -209,4 +213,3 @@ make
 - Inline functions (small, fast)
 - `constexpr` for compile-time computation
 - Namespaces for code organization
-

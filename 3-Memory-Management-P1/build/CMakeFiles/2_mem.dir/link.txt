@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/2_mem.dir/2_mem.cpp.o -o 2_mem 

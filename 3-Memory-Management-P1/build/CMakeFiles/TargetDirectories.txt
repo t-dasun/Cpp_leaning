@@ -1,0 +1,4 @@
+/home/dasun/Documents/projects/Cpp_learining/3-Memory-Management-P1/build/CMakeFiles/1_memaloc-c.dir
+/home/dasun/Documents/projects/Cpp_learining/3-Memory-Management-P1/build/CMakeFiles/2_mem.dir
+/home/dasun/Documents/projects/Cpp_learining/3-Memory-Management-P1/build/CMakeFiles/edit_cache.dir
+/home/dasun/Documents/projects/Cpp_learining/3-Memory-Management-P1/build/CMakeFiles/rebuild_cache.dir

@@ -1,0 +1,1 @@
+/usr/bin/c++ "CMakeFiles/1_memaloc-c.dir/1_memaloc-c.cpp.o" -o 1_memaloc-c 

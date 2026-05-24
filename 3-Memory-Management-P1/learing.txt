@@ -1,0 +1,10 @@
+Process adress spaces (memory)
+- stack (allocate automatically for local var)
+- data section (allocated for globale & static data)
+- heap allocated at runtime (dynamic mem allocation, programmer need to make it free)
+
+Dynamic mem allocation in C (#include stdio.h,stdlib.h in c)
+- malloc (just allocate mem but not initialized) 
+- calloc (allocate more than 1 mem and with initialize to zeros)
+- realloc
+- free 

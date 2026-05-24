@@ -1,0 +1,1 @@
+/usr/bin/c++ "CMakeFiles/1_copy.dir/1_copy-main.cpp.o" CMakeFiles/1_copy.dir/1_copy.cpp.o -o 1_copy 
