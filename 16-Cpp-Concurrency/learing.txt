@@ -1,0 +1,77 @@
+C++ Threads
+
+#include <thread>
+g++ main.cpp -o app -std=c++17 -pthread
+
+std::thread th(func); // hear it pass func name
+th.detach(); // deattach this thread from mian thread
+if (th.joinable()) {th.join()} // id thread is deattached it can't be join so main thread will not wait for th to finish
+system("Pause"); this will help to Pause main thread untill key is press
+
+Args can pass to Threads
+std::thread th(func,arg1, arg2);
+pass by ref is also possible
+std::thread th(func, std::ref(arg)); // make sure func allow pass by refferenc
+// if it is const reference use std::cref(arg)
+
+Get return value of function in Threads
+-  in need to be packaged and pass it to thread
+int Compute(const std::vector<int> &data){... return data;}
+std::package_task<int(const std::vector<int> &)> taskCompute{compute};
+std::future<int> ft taskCompute.get_future(); // this furure is for get the return value
+std::thread threadCompute{std::move(taskCompute), data}; // package obj only move can't copy
+//
+autooo result = ft.get(); // main will hold in this line untill return is available in thread 
+
+mutex in C++11
+#include<mutex>
+std::mutex global_mutex;
+{
+    global_mutex.lock()
+    // access the data in thread 1
+    global_mutex.unlock()
+} // this can happen deadlock if we are not carefull
+// safe to use local object of mutex fo it will autoamticlly distroy end of function
+std::lock_gard<std::mutex> mtx(global_mutex);
+// access the data | no lock unlock needed
+// but this also keep data lock for some time
+
+thread id and naming 
+std::thread t1(process);
+auto id = t1.get_id();
+t1.native_handle() //Give me the OS-level thread object behind this C++ thread
+pthread_setname_np(t1.native_handle(), "worker_1"); //linux
+SetThreadDescription(
+    t1.native_handle(),
+    L"worker_1"
+);
+int cores   = std::tread::hardware_concurrency(); // cores that in hw
+if ideal number of threads==cores it is eficents than more threads
+if u want to get thred id ooof running thread in 
+std::this_thread::get_id();
+std::this_thread::sleep_for(std::chrono::seconds(1)) // add one sec delay to thread
+litterels can use that addes c++14
+std::this_thread::sleep_for(1s) // s is literal
+
+Task std::async() // high level concurrency
+#include <future>
+int func(int count){...return sum;}
+std::future<int> result = std::asyncccc(std::launch::async, func, args)
+if (result.valid()) {
+    //result.wait() // this do wait but no return
+
+    auto sum = result.get();
+
+    auto status = result.wait_for(1s); // using namespace std::chrono_literals need to there 
+
+    //status return std::future_status::defferred,ready,timeout
+    // defferred mean not async, ready mean can return, timeout is not ready
+
+
+    //wait can do wait_untill and create timepoint
+}
+if launch policy is async it create a thread but if not spesified it may happen synchronsly the it will call wehre line call .get()
+we also can make aunch policy defferred {this will make it synchroness no thread}
+
+
+// C++ promis and future synchronisation with thread instade of using mutext to SetThreadDescription explain
