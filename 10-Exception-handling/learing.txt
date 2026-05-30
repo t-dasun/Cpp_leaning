@@ -1,0 +1,47 @@
+C++ Exception
+
+try, catch,, throw
+
+throw std::runtime_error("failed");
+
+try {
+    // func();
+} catch (std::runtime_error &ex) { // pass by ref not to make copy
+    std::cout<<ex.what()<<std::endl; // what print the msg failed
+    //all excepion handling class inherited from std::excepion class
+} catch (std::out_of_range &ex){
+    // can have multible catch blocks 
+    // all exception types should have catch other wise program terminate
+    // if exception type | throw std::out_of_range("msg");
+    std::cout<<ex.what()<<std::endl; 
+}
+
+// if we use new for mem allpcation and it throw std::bad_alloc catcccccch need to handle that
+// but we can have comman catch block
+catch (std::exception &ex) {std::cout<<ex.what()<<std::endl;}
+catch (...){cout<<msg} // this also catch any event not in excepion class but no msg only cout so avoid this
+
+
+stack unwinding
+when excepion theow local objects in that function will distroyied via destructor but heam allocated pointers not , but if we use smart pointers it will distroyied
+
+rethrow
+catch (std::exception &ex) {
+    // base on a condition | if error count > 6
+    std::runtime_error err("failed");
+    ex = err; // this will give new eception to rethrow
+    throw;
+}
+
+// avoid use throw excepions in class distructor it will crach the program
+
+noexcept
+// use that functions sure that no excepions will throw then compiler generate mor optimized code without including stach unwinding.
+but if this function throw an exception program will terminate and crash
+
+int func(int a)noexcept {}
+int func(int a)noexcept(true) {}
+int func(int a)noexcept(false) {} // this mean it accept exceptions
+
+class use userd defined move constructor need to use noexcpt if std containers are there
+To prevent standard library containers (like std::vector) from corrupting your data. If you do not mark your move constructor as noexcept, containers like std::vector will refuse to use it during reallocations and will silently fall back to using the much slower copy constructor instead.
