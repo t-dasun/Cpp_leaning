@@ -1,0 +1,134 @@
+C++ Templates
+
+can use for compiler time polymorphism
+compile time code generation
+high perfomence | use many libraries ATL,WTL,Boost
+
+normally template function implementation should be in the header file.
+Because the compiler must see the full template definition when it creates a specific version.
+both explicit instantiation and template specialization can be done in .cpp
+template normal implementation can be in .cpp, but You must explicitly instantiate every type you want to use.
+
+template<typename T>
+T func(T x,T y){return x+y}
+auto sum = func(1.5f,2.5f); // this will generate float func by compiler
+auto sum1 = func(1,2);// this will generate int func by compiler
+if function not call function is not created by compiler
+
+when we calling 
+func(3,3.5) // this will not work we have to type cast 3 to float or
+func<double>(3,3.5); here T becomes double
+
+// above tamplate func can instentiate for specifc type
+// Explicit Instantiation
+template char func (char x, char y); // god to use | template char func<char> (char x, char y);
+// Explicit instantiations
+template int func<int>(int, int);
+template double func<double>(double, double);
+
+int (*pfn)(int,int) = func; | int result = pfn(2, 3);
+
+if u want func<int, double>(3, 3.5); this to work 
+template <typename T1, typename T2>
+auto func(T1 x, T2 y) {return x + y;} // in above case int+double return double
+
+Explicit Specialization
+template <typename T>
+T Max(T x, T y)
+{
+    return x > y ? x : y;
+}
+// Specialization declaration in header
+template <> const char* Max<const char*>(const char* x, const char* y);
+/ Specialization definition in cpp
+template <> const char* Max<const char*>(const char* x, const char* y)
+{
+    return std::strcmp(x, y) > 0 ? x : y;
+    // why we have explicit specialization becouse char pointer is pass so it compaer adress not value
+    // strcmp use to make sure values are compare
+}
+
+non-type template arguments
+// this work compile time so constexpr, arguments are const can't change 
+template<typename T, int size>
+T Sum(T (&parr)[size]) {
+    T sum{};
+    for (int i=0;i<size;i++){sim+=parr[i];}
+    return sum;
+}
+//call sum | 
+int arr[]{2,3,4,5};
+int result = Sum(arr); // this way size is no need to pass as arg it get at compile time 
+
+Perfect forwading
+class Employee {
+private:
+    std::string m_Namke;
+    Integer m_Id;
+public:
+    template<typename T1, typename T2>
+    Employee (T1 &&name. T2 &&id) { // && use if user pass r value it preseve and pass as r value if it is l value it pass as l value that why we use &&
+        m_Name{std::forward<T1>(name)};
+        m_Id{std::forward<T1>(id)}; 
+        //by using std::forward it pass as its state if r value it pass as r value without convert to l value
+        // this way Integer and string move constructor will call instade of copy when pass as R-value
+    }
+};
+//calling
+Employee emp1{"umar", Integer{100}} // passing r values 
+int value = 100;
+Employee emp1{"umar", value} // passing r value, l value reference seprately
+
+Variadic Templates
+
+function allow n number of arguments any types
+// print function can have many args but it implemented with macrows
+
+print(){} // base case for recursion to end
+//Template parameter pack
+template<typename T,typename...Params>
+void print(T &&a,Param&&... args) {
+    std::cout<<sizeof(args); // find number of args
+    std::cout<<sizeof(param); // find number of parameter types in args
+    std::cout<<a<<",";
+    print(std::forward(args)...); // 1st arg become T a others are pass to print untill all args ar 0 then call base case
+}
+// forward and && use becouse r-values to pass it as it is and move instade of copy
+func call | print(1,2.5,3,4,"5"); // different types can pass
+
+Class Template
+
+tamplate<typename T, int size>
+class stack{
+    T buffer[size];
+    int m_top{-1};
+    ....
+}
+//call
+stack <int,10> s;
+
+class also can do Explicit Specialization
+tamplate<>
+class stack<char*>{...}
+if class one function need to specialization we can so it too in cpp
+
+partial specialization in Templates also posible
+
+typedef gives meaning full names fo exisiting types
+typedef long long LLONG;
+LLONG elem{} //LLONG is the new type
+c++11 prefer to use auto
+
+Type alias
+using UINT = unsigned int;
+UINT val{};
+template<typename T>
+using Name = std::vector<std::list<T>>;
+
+type traits
+#include <type_traits>
+is_integreal<int>::value
+is_floating_point<T>::value
+remove_reference<T>::type // if T is reference it remove reference from it
+
+static_assert(false,"msg") // is false program stop else run
