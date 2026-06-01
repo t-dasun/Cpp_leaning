@@ -145,6 +145,7 @@ std::unique_ptr<int> CreateValue() {
 }
 
 auto result = CreateValue();  // Efficient, no copy
+// std::unique_ptr<int>& CreateValue() not possible because ptr is will delete 
 ```
 
 ---
