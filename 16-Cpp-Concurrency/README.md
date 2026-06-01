@@ -443,6 +443,20 @@ Use `std::promise` when:
 
 ---
 
+std::shared_future (The Broadcast Receiver)
+​Purpose: Allows multiple threads to wait for and read the exact same result simultaneously.
+​Copyable: Unlike a standard std::future (which is move-only and single-use), a std::shared_future can be copied freely to as many threads as you need.
+​How .get() works: Calling .get() returns a const reference to the data. It does not destroy the data, meaning multiple threads can read it safely without a mutex.
+
+
+| Task | Tool to Use |
+| :--- | :--- |
+| **Send data/signal from one thread** | `std::promise` |
+| **Receive data in exactly ONE thread** | `std::future` |
+| **Broadcast data/signal to MULTIPLE threads** | `std::shared_future` |
+| **Modify shared data *after* it's been sent** | Pass a pointer to a struct containing a `std::mutex` *through* the future. |
+---
+
 ## Best Practices
 
 - Prefer `std::lock_guard` instead of manual `lock()` and `unlock()`.
