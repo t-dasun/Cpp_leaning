@@ -180,7 +180,7 @@ int main()
     std::vector<int> data {1, 2, 3, 4, 5};
 
     std::packaged_task<int(const std::vector<int>&)> task(ComputeSum);
-    std::future<int> result = task.get_future();
+    std::future<int> result = task.get_future(); // need to ge future beofre move task, task can't copy
 
     std::thread th(std::move(task), std::cref(data));
 
