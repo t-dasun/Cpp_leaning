@@ -125,6 +125,18 @@ ProcessValue(std::move(myPtr));  // Transfer ownership
 // Cannot use: std::cout << *myPtr;  // Crash!
 ```
 
+```cpp
+void ProcessValue(std::unique_ptr<int>& ptr) {
+    std::cout << *ptr << std::endl;
+}  // ptr deleted here
+
+auto myPtr = std::make_unique<int>(42);
+ProcessValue(myPtr);  //Not Transfer ownership
+
+// myPtr can use
+// shared_ptr use if need to give multiple ownership
+```
+
 ### **Returning from Functions (Automatic Move)**
 ```cpp
 std::unique_ptr<int> CreateValue() {
