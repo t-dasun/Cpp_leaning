@@ -1,0 +1,186 @@
+
+
+std::string s = std::to_string(42);
+-------------------------------------------------------------------------
+A calling convention specifies how function parameters are passed, how return values are returned, and who is responsible for cleaning the stack during a function call.
+cdecl      -> common C/C++ convention | arguments are usually passed through the stack, and the caller cleans the stack.
+stdcall    -> often used in Windows API
+fastcall   -> passes some arguments in registers
+thiscall   -> used for C++ member functions, especially older MSVC
+pascal     -> older convention
+syscall    -> system call convention
+-------------------------------------------------------------------------
+__fastcall, the compiler tries to pass some arguments using CPU registers instead of the stack, so function calls may be faster.
+int __fastcall add(int a, int b) {
+    return a + b;
+}
+-------------------------------------------------------------------------
+On Linux, binary/executable files usually use the ELF format.
+ELF = Executable and Linkable Format
+-------------------------------------------------------------------------
+long long introduced in c++11
+override introduced in c++11
+-------------------------------------------------------------------------
+c++14 features
+auto return type deduction
+generic lambdas
+variable templates
+binary literals
+digit separators
+std::make_unique
+
+int value = 1'000'000;
+-------------------------------------------------------------------------
+struct A {
+    template <typename X>
+    void foo(X value) {
+        std::cout << value << std::endl;
+    }
+};
+
+template <typename T, typename U>
+void call_foo(T t, U u) {
+    t.template foo<U>(u); //t has a member function named foo, and foo itself is a template function.
+}
+
+int main() {
+    A a;
+    call_foo(a, 100);
+}
+
+-------------------------------------------------------------------------
+mutable int accessCount = 0; // even via const function this member of a class can change
+auto f = [x]() mutable{} // this capture x as copy and can change it other wise it can't in lambda, but changes not goes outof scope with mutable, for that u need to pass by reference
+-------------------------------------------------------------------------
+const volatile int x
+I can read the register, but I should not write to it, and the value may change at any time due to hardware.
+-------------------------------------------------------------------------
+Valid file modes include:
+
+ios::trunc   // truncate file when opening
+ios::ate     // open and move to end immediately
+ios::app     // append mode
+ios::in      // input/read
+ios::out     // output/write
+ios::binary  // binary mode
+
+(A) <ofstream> write only
+(B) <ifstream> read only
+(C) <fstream> read write
+
+std::ifstream file("test.txt");
+auto pos = file.tellg(); // gets current read position (get pointer) 
+tellp() // for get current write pointer (put pointer) 
+
+ofstream file("data.txt", ios::app);
+file << "New line added\n";
+
+You can combine modes using |
+fstream file("data.txt", ios::in | ios::out);
+Meaning: open file for both reading and writing.
+
+Binary read:
+ifstream file("data.bin", ios::in | ios::binary);
+
+ifstream file("data.txt");
+file.seekg(0);  // move read pointer to beginning
+file.seekp(x) // move write pointer to specifc location ofstream open or fstream
+
+-------------------------------------------------------------------------
+
+int main(int argc, char *argv[]){}
+what would be the value of argv[argc]?NULL pointer
+// argv[0]       -> program name
+// argv[1]       -> first command-line argument
+-------------------------------------------------------------------------
+struct student {	
+    char a;  // 1 byte
+    char b;  // 1 byte
+    int c;   // usually 4 bytes
+};
+char a  -> 1 byte
+char b  -> 1 byte
+padding -> 2 bytes
+int c   -> 4 bytes
+
+struct student {	
+    char a; // 1 byte
+    int c;  // 4 bytes
+    char b; // 1 byte
+};
+char a   -> 1 byte
+padding  -> 3 bytes
+int c    -> 4 bytes
+char b   -> 1 byte
+padding  -> 3 bytes
+
+Why  3 bytes padding?
+
+The whole struct must usually be aligned to the largest member alignment. Here largest member is int, usually 4-byte aligned. So total struct size should be a multiple of 4.
+
+-------------------------------------------------------------------------
+#include <algorithm>
+void func(int i){...}
+std::vector<int> v = {1, 2, 3, 4};
+std::for_each(v.begin(), v.end(), func);
+-------------------------------------------------------------------------
+enum color {
+    black, // 0
+    blue,  // 1
+    red    // 2
+};
+cout << sizeof(obj); // 4
+but modern compiler allows more or enum color : char {..} this will give 1 byte only
+-------------------------------------------------------------------------
+modern C++, you can initialize structure members inside the structure itself, before c++ 11 not
+
+-------------------------------------------------------------------------
+g++ hello.cpp -o hello  | hello executable ./hello
+g++ hello.cpp | ./a.out 
+g++ -c main.cpp | creat object file 
+-------------------------------------------------------------------------
+In C++, only synchronous exception can be handled
+
+Asynchronous exceptions
+These are external/system-level events, such as:
+hardware interrupt
+segmentation fault
+access violation
+divide-by-zero signal
+Ctrl+C signal
+OS kill signal
+
+-------------------------------------------------------------------------
+private inheritance from base class  A to child B
+outside code cannot access the base part through the derived object.
+B can call public and protected in B calss, but B object can't call A functions in main 
+
+protected inheritance also same but in protected grand child can accless base public but if child is prvate inherit from base grand child can't 
+grand child should inherit publicli from child
+-------------------------------------------------------------------------
+In OOP
+even object slicing happen code works if child copy to basebut if u copy base to child its give an error
+-------------------------------------------------------------------------
+Singleton
+Private constructor       -> prevents direct object creation
+Deleted copy constructor  -> prevents copying
+Deleted assignment        -> prevents assignment
+Static GetInstance()      -> gives access to the single object
+-------------------------------------------------------------------------
+class members are initialized in the order they are declared, not the order in the constructor initializer list.
+
+-------------------------------------------------------------------------
+
+c++ storage class 
+
+mutable
+thread_local | thread_local int counter = 0;
+
+from C to c++ 
+extern
+auto
+static
+register
+-------------------------------------------------------------------------
+Const objects can call only call const functions
+

@@ -1,0 +1,123 @@
+C++ STL 
+
+All the containers use class allcator internally for amange memery inside containers
+
+containers 3 types
+- Sequence [array vector list deque forward_list] <header same as name>
+- Associative [set mutliset (<set>) map mutlimal <map>] 
+- Unordered [unordered_set unordered_mutliset (<unordered_set>) unordered_map unordered_mutlimal <unordered_map>]
+
+Iterators
+std::begin(); //start of a containers
+std::end(); // point to end od container + 1
+
+std::array 
+static array, support iterators, know about size
+provide random access, cannot grow (create compile time), can use with c functions
+std::array<int,5> arr {1,2,3,4,5};
+arr.data(); // return pointer to standerd array that can pass to c functions
+
+std::vector
+behave like dynamic array
+grow automaticaly
+efficent add and remove at end
+provide random access
+not good for insersion and deletion (middle)
+std::vector<int> vec {1,2,3,4,5};
+auto itr = vec.begin();
+
+vec.insert(vec.begin()+x, value) // insert value at x location from begin (not efficent)
+vec.erase(vec.end-x); remove element to the 3rd from end (not efficent)
+
+vec.pop_back()// remove last element
+
+
+std::deque (double ended queue) 
+// similar to vector but we can add element from both ends
+grow automaticaly
+efficent add and remove at both ends
+provide random access
+not good for insersion and deletion (middle)
+push_back. push_front, pop_back pop_front
+insert, erase , itr same as vector
+
+std::list
+implemented as two way acess linked list
+no random access
+efficient for insertion and deletion anyware
+auto itr = listc.begin();
+listc.insert(vec.begin()+x, value);
+listc.erase(vec.end-x);
+
+
+std::forward_list
+implemeted as one-way linked list 
+small memory footprint
+efficent for delete/insertion
+does not provide size
+elements added at the front
+std::forward_list<int> listc {1,2,3,4,5};
+no push_back, we have push_front
+we access listc 1,2,3,4,5 in reverse order 
+listc.insert_after(listc.begin(),10) // add value 10 to seconnd position
+lestc.erase_after(listc.begin()) // erase second element
+
+std::set/std::multiset
+implemented as a binary tree
+elments are stored in sorted order (<&>)
+value act as a key
+fast serch
+no random access
+elements cannot modified directly
+std::set<int> s{18,2,4,5,3}
+s.insert(9);
+s.erase(2); // erase the value 2 (value use as key)
+s.erase(s.begin()) // erase using iterator 
+auto itr = s.begin(); | *itr = 5 this wont work becouse itr retuen in here as const
+itr = s.find(9);
+if (itr!=s.end()) {//found} else {not found}
+std::set<int, std::lesser> s, // lesser (low to high sorted) by default can use grater too | need #include<functional>
+set not allow dublicate values even u insert it is not in set but multi_set can
+in multiset we can find value it return 1st value iterator
+auto found = s.equal_range(3); in mutlti set value 3, begin and end+1(next value) pointers pair return
+
+
+std::map/std::multimap
+implemented as a binary tree
+elments are stored as pairs
+value act as a key
+fast serch
+no random access
+elements key cannot modified directly, values can
+map<int, string> m1; next parameter std::lesser defult can be std::gratter after pair
+map<int, string> m2 = {{1, "Geeks"},
+              {2, "For"}, {3, "Geeks"}};
+m.insert(std::make_pair(1, "Geeks"));
+m.insert(std::pair<int, string>(2, "Geek"));
+// erase is possible same as set
+m[1] = "dasun" // can change the value by key but not key
+m[11] = "dasun"  // can also insert like this 
+auto it = m.find(2);
+if (it != m.end())
+    cout << it->first << " " << it->second;
+it = m.find(1) // find by key if itr != m.end () value is itr->second
+mutimap support duplicate 6,"dasun" ,6,"madu"
+equal_range works same as set
+
+unordered_set (hash table) unordered_multiset
+//bucket 
+
+unordered_map (hash table) unordered_multimap
+
+hash 
+
+stl algorithm
+include note
+sort with containers operator overloading, or lamda functionfunction object passing
+algorithm count, count_if find_if 
+
+note to extract fromset and edit and move it back instade or remove and insert
+
+vector emplase_back vs push_back
+
+for each alogrithm with call abck
