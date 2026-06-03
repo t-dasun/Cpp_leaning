@@ -30,6 +30,7 @@ digit separators
 std::make_unique
 
 int value = 1'000'000;
+constexpr T pi = T(3.1415926535897932385); // variable templates
 -------------------------------------------------------------------------
 struct A {
     template <typename X>
@@ -183,4 +184,86 @@ static
 register
 -------------------------------------------------------------------------
 Const objects can call only call const functions
+-------------------------------------------------------------------------
+    #include <iostream>
+    #include <stdarg.h>
+    using namespace std;
+    void dumplist(int, ...);
+    int main()
+    {
+        dumplist(2, 4, 8);
+        dumplist(3, 6, 9, 7);
+        return 0;
+    }
+    void dumplist(int n, ...)
+    {
+        va_list p;
+        int i;
+        va_start(p, n);
+        while (n-->0) 
+        {
+            i = va_arg(p, int);
+            cout << i;
+        }
+        va_end(p);
+    } 
+-------------------------------------------------------------------------
+Late Binding (Dynamic Binding): The process of waiting until runtime to determine which implementation of a function to execute, based on the actual object type rather than the pointer/reference type. This is how virtual functions operate in C++.
 
+Dynamic Linkage: While often used to describe linking external library files (like .dll or .so) at runtime,
+-------------------------------------------------------------------------
+virtual functions does not give the ability to write a templated function
+-------------------------------------------------------------------------
+Classes express functionality which represents responsibilities mixin class
+
+-------------------------------------------------------------------------
+get<0>(vec); // wrong
+vec.get(0);   // wrong
+get<0>(Arr)
+vec.at(0)
+
+-------------------------------------------------------------------------
+The constants are also called as literals
+-------------------------------------------------------------------------
+x + (++x)
+x + ++x // both undifined behaviour
+-------------------------------------------------------------------------
+container, engineers typically rely on 3 primary sets of requirements:
+Structural & Load Requirements
+Transportation & Handling Requirements
+Safety & Certification Requirements
+-------------------------------------------------------------------------
+C++ we can have a class without a name, called an anonymos class 
+-------------------------------------------------------------------------
+2[arr] = arr[2] = *(2 + arr)
+-------------------------------------------------------------------------
+c++ is a bottom-up langage
+-------------------------------------------------------------------------
+*this pointer is pass as a arg for all non static funcs of the class
+-------------------------------------------------------------------------
+c++ files are open in text mode
+-------------------------------------------------------------------------
+wchar_t (wide character) represent more mem than 1 byte charbits different base on system 16bit for 32bit Linuxstd::sstring,std::wcin,std::wcout (wide character in/out)
+-------------------------------------------------------------------------
+sizeof(x) // evalvate x in compile time | cant do math inside sizeof sizeof empty class = 1, size of void = 0
+sizeof(float+int)= sizeof(float)= 4 bytes
+-------------------------------------------------------------------------
+lambda capture []
+[=] allow all in main as const can't change
+[=]()mutable // allow pass as a copy  can change but out of the scope not changed
+[&] // pass by reference
+-------------------------------------------------------------------------
+distructooor can be pure virtual but need a implemntaion on cpp
+-------------------------------------------------------------------------
+if u implemet parameterize constructor and if u need default constructor too 
+A() = default; // other from rule of 5 also implimeted auto if u don't have pointers
+
+rule of 5 need when we mannualy mange resorces
+if we have user defined destructor we need to add move constructor & assigment
+-------------------------------------------------------------------------
+if we pass uinque_ptr to a vector we need to move give owner ship
+other wise for nomal funtions we can use pass by reference
+
+-------------------------------------------------------------------------
+c++ has 4 level of exception safty
+-------------------------------------------------------------------------
