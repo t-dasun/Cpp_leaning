@@ -172,7 +172,7 @@ thread_local int counter = 0; // every single thread gets its own unique, indepe
 ```
 ```cpp
 extern int accessCount; // cpp1
-nt accessCount = 0;// cpp2
+int accessCount = 0;// cpp2
 ```
 
 
