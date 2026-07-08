@@ -161,13 +161,20 @@ Storage-related keywords:
 - `register`
 
 ​extern "C" avoid name mangaling, useful when c func call c++ or otherwise.
-Just extern is used to share global variables or functions across multiple .cpp 
+extern is used to share global variables or functions across multiple .cpp 
+This variable or function exists, but its actual memory allocation and definition are in a different file 
+
 
 Example:
 
 ```cpp
 thread_local int counter = 0; // every single thread gets its own unique, independent copy of the variable.
 ```
+```cpp
+extern int accessCount; // cpp1
+nt accessCount = 0;// cpp2
+```
+
 
 ## 6. Structs, Padding, And Enums
 
