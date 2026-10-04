@@ -4,10 +4,11 @@ This is a beginner-oriented map of the repository. Read it in order the first ti
 
 1. [The one-minute mental model](#the-one-minute-mental-model)
 2. [The complete request flow](#the-complete-request-flow)
-3. [The interfaces](#the-interfaces)
-4. [The modules and every source file](#the-modules-and-every-source-file)
-5. [How to build and run it](#how-to-build-and-run-it)
-6. [How to follow a real call in a debugger](#how-to-follow-a-real-call-in-a-debugger)
+3. [Call-stack trees](#call-stack-trees)
+4. [The interfaces](#the-interfaces)
+5. [The modules and every source file](#the-modules-and-every-source-file)
+6. [How to build and run it](#how-to-build-and-run-it)
+7. [How to follow a real call in a debugger](#how-to-follow-a-real-call-in-a-debugger)
 
 The guide describes the current source tree. It does not treat files under `build/`, `results/`, downloaded models, or prepared datasets as application source code.
 
@@ -156,6 +157,270 @@ The repository writes `summary.json`, `status.json`, `events.jsonl`, `audio_timi
 `serve` creates the same manager and suite executor used by the CLI. [`backend/transport/src/api_service.cpp`](../backend/transport/src/api_service.cpp) handles versioned REST routes for capabilities, configuration resolution, history, artifacts, reports, suites, jobs, and stop requests.
 
 [`backend/transport/src/websocket.cpp`](../backend/transport/src/websocket.cpp) implements the loopback WebSocket protocol, including masked client frames, bounded frame sizes, origin checks, PCM sequence checks, EOF, ACK/credit flow control, and an observation replay feed. The service is a local prototype: it does not claim TLS, authentication, remote exposure, durable job storage, or production retention policy.
+
+## Call-stack trees
+
+These trees show the important calls in order. They are intentionally less detailed than the source code: use them as a map, then open the linked file and search for the named symbol. An indented item means the function below it is called from the function above it. A callback arrow means control returns through an interface.
+
+### Common startup tree
+
+All CLI commands begin in the same place:
+
+```text
+main(argc, argv)                                      apps/asr_cli/main.cpp
+├─ parse command-line options
+├─ resolve_config(config_path, overrides)              configs/src/config.cpp
+│  ├─ defaults()
+│  ├─ merge(YAML node, ...)
+│  ├─ apply --set overrides
+│  └─ validate and build RunConfig
+├─ make_manager(config)                                apps/asr_cli/main.cpp
+│  ├─ FactoryWorkerExecutor(...)
+│  ├─ MockEngine factory OR NativeQwenEngine factory
+│  ├─ LeastActiveScheduler OR RoundRobinScheduler
+│  └─ SessionManager(layout, executor, scheduler)
+└─ dispatch action
+  ├─ validate
+  ├─ dry-run / run
+  ├─ load-dry-run / load
+  ├─ sweep-dry-run / sweep
+  └─ serve
+```
+
+`make_manager` does not perform inference. It builds objects and dependencies so later code can work through interfaces.
+
+### One direct `run` call
+
+This is the simplest complete path. Start here when learning the C++ system:
+
+```text
+main
+└─ run command dispatch                                apps/asr_cli/main.cpp
+  ├─ prepare synthetic PCM OR read_wav(...)            audio/src/wav.cpp
+  ├─ run_baseline(...)                                 benchmark/src/baseline.cpp
+  │  ├─ FileResultRepository::begin(...)               storage/src/repository.cpp
+  │  ├─ create ResourceMonitor                        observability/src/system_sampler.cpp
+  │  ├─ engine.create_session(...)                     IASREngine
+  │  │  └─ SessionManager::create_session
+  │  │     ├─ scheduler->select(workers)
+  │  │     ├─ executor->make_engine()
+  │  │     └─ ManagedSession::initialize
+  │  │        └─ inner_engine->create_session
+  │  ├─ PacedAudioStream::produce_ready/pop             audio/src/delivery.cpp
+  │  ├─ session->submit(AudioChunk)                    IASRSession
+  │  │  └─ ManagedSession::submit
+  │  │     └─ inner_session->submit
+  │  │        └─ MockSession::submit OR NativeSession::submit
+  │  ├─ sink.on_event(...)                              IRecognitionSink callback
+  │  │  ├─ RepositorySink::on_event
+  │  │  └─ FileResultRepository::append
+  │  ├─ session->finish_input()
+  │  │  └─ MockSession::finish_input OR NativeSession::finish_input
+  │  │     └─ sink.on_event(final)
+  │  ├─ measurements.summary()                          observability/src/metrics.cpp
+  │  └─ FileResultRepository::finish(...)
+  └─ return JSON summary / error
+```
+
+The important loop is `produce_ready -> pop -> submit`. Audio delivery owns when a chunk is available; the engine owns what the chunk means.
+
+### Mock engine branch
+
+```text
+ManagedSession::submit
+└─ MockSession::submit                              engines/mock/src/mock_engine.cpp
+  ├─ validate run_id, call_id, sequence, sample offset, format, and size
+  ├─ update consumed_samples and session state
+  ├─ update_text()
+  └─ emit(EventKind::partial)
+    └─ IRecognitionSink::on_event
+
+ManagedSession::finish_input
+└─ MockSession::finish_input
+  ├─ update_text()
+  └─ emit(EventKind::final)
+    └─ RepositorySink::on_event
+```
+
+The mock does not recognize speech. Its text is deliberately predictable, such as the selected language, seed, and consumed sample count. It proves transport, lifecycle, persistence, and measurement plumbing.
+
+### Native Qwen branch
+
+```text
+ManagedSession::initialize
+└─ NativeQwenEngine::create_session
+  └─ NativeSession constructor / spawn()
+    ├─ pipe2(input_pipe), pipe2(output_pipe)
+    ├─ posix_spawn(asr-native-worker)
+    └─ worker_main(argc, argv)                         separate process
+      ├─ validate parent ownership and CPU affinity
+      ├─ create LiveBuffer and Qwen context
+      ├─ start read_audio thread
+      └─ invoke Qwen live runtime
+
+ManagedSession::submit
+└─ NativeSession::submit
+  ├─ write binary wire header + PCM16 to worker stdin
+  ├─ read_available(...) / drain worker JSON
+  └─ handle_line(...)
+    ├─ partial -> emit(EventKind::partial)
+    ├─ timing -> sink.on_observation(...)
+    ├─ final -> keep pending final
+    └─ failed -> fail(...) and kill/reap child
+
+worker_main
+├─ read_audio(Context&)
+│  ├─ read_exact(fd 3, Header)
+│  ├─ validate sequence and first_sample
+│  ├─ convert PCM16 to float live-buffer samples
+│  └─ emit timing JSON
+└─ token_callback(piece, Context*)
+  ├─ join incomplete UTF-8 fragments
+  ├─ append text snapshot
+  └─ output({type: partial, text, consumed_samples, ...})
+
+ManagedSession::finish_input
+└─ NativeSession::finish_input
+  ├─ send binary EOF frame
+  ├─ drain pending final/refinement messages
+  └─ emit(EventKind::final)
+```
+
+The controller process owns the application contract. The child owns Qwen vendor headers, model memory, and runtime-global state. This boundary is why a native timeout can terminate one worker without taking down the CLI.
+
+### `load` command tree
+
+```text
+main
+└─ load command dispatch                             apps/asr_cli/main.cpp
+  ├─ prepare WAV/synthetic input
+  ├─ plan_load(config, LoadSpec, samples, memory)     benchmark/src/load.cpp
+  │  ├─ linux_available_memory_bytes()
+  │  ├─ validate bounds and languages
+  │  ├─ estimate disk, memory, and duration
+  │  └─ create seeded LoadPlan.calls
+  └─ run_load(config, manager, plan, ...)
+    ├─ write plan.json and RUNNING status
+    ├─ for each warmup/repetition phase
+    │  ├─ create ResourceMonitor
+    │  ├─ start worker threads and latch
+    │  └─ each thread calls run_baseline(...)
+    │     └─ same direct call tree above
+    ├─ aggregate call results and metrics
+    ├─ evaluate_load_slo(...)
+    └─ write suite summary/status
+```
+
+Warmups are planned and executed but excluded from measured-call SLO populations. `--mode network` changes the engine passed into `run_load`: it uses a loopback `WebSocketEngine`, so the benchmark includes the actual transport boundary.
+
+### `sweep` command tree
+
+```text
+main
+└─ sweep command dispatch
+  ├─ plan_sweep(config_path, overrides, SweepSpec, samples, memory)
+  │  ├─ make_case(...) for baseline/selected/OAT/matrix/scale
+  │  │  ├─ resolve_config(...)
+  │  │  └─ plan_load(...)
+  │  └─ shuffle bounded OAT/matrix cases using seed
+  └─ run_sweep(plan, output_root, executor, cancel)
+    ├─ checkpoint summary.json as RUNNING
+    ├─ run_case(...) for each effective case
+    │  └─ executor(config, fresh_load_plan)
+    │     └─ run_load(...) -> run_baseline(...)
+    ├─ for scale: find first failure and binary-refine boundary
+    └─ checkpoint final case/status counts
+```
+
+A skipped case is part of the evidence. It is not silently removed because a native-only setting has no effect on the mock engine or because preflight rejects the resources.
+
+### `serve` startup and REST tree
+
+```text
+main
+└─ serve command dispatch                              apps/asr_cli/main.cpp
+  ├─ make_manager(config)
+  ├─ create ServiceAdmissionGate
+  ├─ create LinuxSystemSampler + runtime callback
+  ├─ create ApiService(..., execute_suite, runtime)
+  ├─ create WebSocketServer(manager, port, &api, &gate)
+  │  └─ accept_loop() -> one handler thread per client
+  └─ wait until SIGINT/SIGTERM, then destroy server/jobs
+
+HTTP client request
+└─ WebSocketServer::handle_client(fd)                  backend/transport/src/websocket.cpp
+  ├─ parse HTTP request and body limits
+  ├─ origin/CORS validation
+  └─ ApiService::handle(request)                      backend/transport/src/api_service.cpp
+    ├─ GET /v1/capabilities -> static capabilities JSON
+    ├─ GET /v1/runtime -> runtime callback
+    ├─ GET /v1/jobs -> in-memory job states
+    ├─ POST /v1/config/resolve -> resolve_config
+    ├─ GET /v1/history -> scan output directories
+    ├─ GET /v1/artifacts/... -> safe allow-listed file
+    ├─ GET /v1/reports... -> safe report lookup
+    ├─ POST /v1/suites/dry-run -> execute_suite(body, true)
+    └─ POST /v1/suites
+      ├─ validate idempotency key and admission
+      ├─ start job thread
+      └─ execute_suite(body, false)
+        ├─ resolve_config(...)
+        ├─ plan_load OR plan_sweep
+        └─ run_load OR run_sweep
+```
+
+The HTTP parser and route handler are in different files on purpose: `websocket.cpp` owns sockets/framing, while `api_service.cpp` owns application routes and artifact policy.
+
+### Live browser WebSocket tree
+
+```text
+React main.tsx
+└─ App()
+  ├─ requestJson(base, /v1/capabilities)               frontend/src/api.ts
+  ├─ StreamingPanel
+  │  ├─ chooseFile(file) -> decodeWav(file)            frontend/src/wav.ts
+  │  ├─ start() -> createStream(...)                   frontend/src/stream.ts
+  │  └─ WebSocket ws://127.0.0.1:port/v1/asr
+  │     ├─ send JSON start frame
+  │     ├─ receive ready/credits
+  │     ├─ send JSON chunk metadata + binary PCM frame
+  │     ├─ receive ACK and transcript event frames
+  │     └─ send EOF or cancel
+  └─ RuntimePanel -> GET /v1/runtime
+
+WebSocketServer::handle_client(fd)
+└─ GET /v1/asr upgrade
+  ├─ read start JSON frame
+  ├─ gate.enter_live()
+  ├─ manager.create_session(...)
+  ├─ send ready with one credit
+  ├─ for each chunk
+  │  ├─ read JSON metadata + binary PCM16
+  │  ├─ session->submit(AudioChunk)
+  │  └─ send ACK / event / observation
+  └─ EOF -> session->finish_input() -> done
+```
+
+The browser's `stream.ts` is a client of the C++ server; it is not another ASR engine. The server still owns session state, scheduling, engine selection, and recognition.
+
+### Observer replay tree
+
+```text
+Runtime/observation browser client
+└─ WebSocket GET /v1/observe?run_id=...&call_id=...&since=N
+  └─ WebSocketServer::handle_observer(fd)
+    ├─ validate identity, origin, protocol, and cursor
+    ├─ ObservationHub::get(key)
+    ├─ replay retained messages after cursor
+    ├─ emit gap when old messages were evicted
+    └─ emit observer_done when the call feed closes
+
+ServerSink::on_event/on_observation
+└─ ObservationHub::publish(feed, message)
+  └─ bounded 128-message feed with delivery_sequence
+```
+
+The observer feed is separate from audio ingress. A slow dashboard subscriber can miss old observations and receive a gap notification without blocking the live audio session.
 
 ## The interfaces
 
@@ -312,13 +577,40 @@ The important ownership rule is that `ManagedSession` destroys the inner engine 
 - [`backend/transport/include/asr/backend/service_gate.hpp`](../backend/transport/include/asr/backend/service_gate.hpp): coordination between interactive calls and suite jobs.
 - [`backend/transport/include/asr/backend/websocket.hpp`](../backend/transport/include/asr/backend/websocket.hpp): server entry point and streaming service declarations.
 - [`backend/transport/src/api_service.cpp`](../backend/transport/src/api_service.cpp): REST routing, safe artifact access, config resolution, asynchronous jobs, idempotency keys, job status, and cooperative stop.
-- [`backend/transport/src/websocket.cpp`](../backend/transport/src/websocket.cpp): HTTP upgrade, WebSocket frame parsing/writing, origin and size checks, binary PCM protocol, ACK credits, EOF handling, and observation replay.
+- [`backend/transport/src/websocket.cpp`](../backend/transport/src/websocket.cpp): HTTP upgrade, WebSocket frame parsing/writing, origin and size checks, binary PCM protocol, ACK credits, EOF handling, observation replay, and the loopback `WebSocketEngine` client used by network-mode load tests.
 - [`backend/transport/README.md`](../backend/transport/README.md): protocol and security boundary notes.
 
 ### CLI application
 
 - [`apps/asr_cli/main.cpp`](../apps/asr_cli/main.cpp): command parsing, strict scalar parsing, config loading, engine/manager construction, baseline/load/sweep dispatch, and server startup.
 - [`apps/README.md`](../apps/README.md): entry-point status. The repository currently has one implemented CLI composition root; older reserved application names in this README are not separate current executables.
+
+### Frontend engineering console
+
+The frontend is now implemented as a local React 19/Vite console. It does not perform recognition itself. It calls the C++ service over HTTP and WebSocket, displays server capabilities/runtime/artifacts, and keeps browser-side observations separate from server measurements.
+
+- [`frontend/index.html`](../frontend/index.html): browser document shell containing the React root element.
+- [`frontend/package.json`](../frontend/package.json): frontend scripts for Vite development/build, Vitest unit tests, Playwright-based browser tests, and UI-overhead measurement.
+- [`frontend/vite.config.ts`](../frontend/vite.config.ts): Vite configuration.
+- [`frontend/tsconfig.json`](../frontend/tsconfig.json): TypeScript compiler configuration.
+- [`frontend/src/main.tsx`](../frontend/src/main.tsx): React bootstrap; finds `#root`, enables `StrictMode`, imports styles, and renders `App`.
+- [`frontend/src/App.tsx`](../frontend/src/App.tsx): top-level state and layout. It remembers the loopback service origin, requests capabilities, tracks connection/log state, and mounts Streaming, Runtime, Experiment, History, and Log panels.
+- [`frontend/src/api.ts`](../frontend/src/api.ts): typed REST models, loopback-origin validation, HTTP JSON requests, WebSocket URL conversion, and allow-listed artifact downloads.
+- [`frontend/src/stream.ts`](../frontend/src/stream.ts): browser WebSocket streaming client. It sends start/chunk/EOF/cancel frames, observes one-credit ACK flow control, and converts server event/observation frames into UI callbacks.
+- [`frontend/src/wav.ts`](../frontend/src/wav.ts): browser-side WAV selection/decoding and conversion into mono 16 kHz PCM16 for live streaming.
+- [`frontend/src/types.ts`](../frontend/src/types.ts): shared frontend state, event, log, and callback types.
+- [`frontend/src/metrics.ts`](../frontend/src/metrics.ts): browser-side display calculations for charts, progress, latency, and runtime summaries. These values are client observations, not replacements for server artifacts.
+- [`frontend/src/styles.css`](../frontend/src/styles.css): responsive engineering-console visual design and layout.
+- [`frontend/src/components/StreamingPanel.tsx`](../frontend/src/components/StreamingPanel.tsx): file selection, language selection, start/stop/reset controls, transcript revisions, and live stream status.
+- [`frontend/src/components/RuntimePanel.tsx`](../frontend/src/components/RuntimePanel.tsx): polls `/v1/runtime` and displays workers, queue depth, host CPU/memory, and sampled process-tree RSS.
+- [`frontend/src/components/ExperimentPanel.tsx`](../frontend/src/components/ExperimentPanel.tsx): load/sweep form, config resolve, dry-run, asynchronous job start/stop, job polling, and result display.
+- [`frontend/src/components/HistoryPanel.tsx`](../frontend/src/components/HistoryPanel.tsx): history refresh, run summary loading, transcript comparison, and artifact downloads.
+- [`frontend/src/components/LogPanel.tsx`](../frontend/src/components/LogPanel.tsx): bounded client-side event/log display.
+- [`frontend/src/core.test.ts`](../frontend/src/core.test.ts): frontend unit tests for pure client behavior.
+- [`frontend/tests/dashboard.e2e.mjs`](../frontend/tests/dashboard.e2e.mjs): mock-service browser workflow test.
+- [`frontend/tests/dashboard.native.e2e.mjs`](../frontend/tests/dashboard.native.e2e.mjs): native-service browser workflow test.
+- [`frontend/tests/dashboard-overhead.mjs`](../frontend/tests/dashboard-overhead.mjs): measures dashboard overhead separately from server timings.
+- [`frontend/README.md`](../frontend/README.md): frontend setup, service URL, build, and browser-test instructions.
 
 ### Evaluation and Python tooling
 
@@ -382,7 +674,7 @@ Tests are not only correctness checks; they are executable examples of the inten
 - [`docs/m0-code.md`](m0-code.md) through [`docs/m7-code.md`](m7-code.md): milestone-specific code maps and commands.
 - [`docs/decisions/`](decisions/): architecture decision records and predeclared gates.
 - [`reports/README.md`](../reports/README.md), [`microbenchmarks/README.md`](../microbenchmarks/README.md), and [`schemas/README.md`](../schemas/README.md): reserved/reporting/schema notes; they are not the live web UI.
-- [`frontend/README.md`](../frontend/README.md): frontend status. The current repository does not contain a React/Vite application implementation; the backend service is the implemented M7 boundary.
+- [`frontend/README.md`](../frontend/README.md): frontend setup and test instructions. The current repository contains an implemented React/Vite engineering console attached to the local M7 service.
 
 ## How to build and run it
 
@@ -462,14 +754,14 @@ For a suite, start with `plan.json`, then `status.json`, then the suite summary 
 
 ## What is implemented and what is not claimed
 
-The source contains a functioning M0-M7 prototype: model-free tests, native CPU integration, single-call measurement, isolated session management, load/sweep planning, and a local REST/WebSocket service. The status document is the authority for measured evidence.
+The source contains a functioning M0-M8 prototype: model-free tests, native CPU integration, single-call measurement, isolated session management, load/sweep planning, a local REST/WebSocket service, and an engineering dashboard. The status document is the authority for measured evidence.
 
 Important boundaries:
 
 - The native process-isolated worker is a prototype, not production hardening.
 - The service is loopback-oriented and has no TLS/authentication/remote-client support claim.
 - Large native sweeps, multi-model saturation, official production accuracy, long endurance, and formal capacity sizing remain evidence gaps unless a specific result says otherwise.
-- The frontend directory has documentation but no implemented React/Vite dashboard in the current source inventory.
+- The React/Vite frontend is an implemented local engineering console; its native overhead screen is documented in `docs/m8-code.md`, not a production capacity result.
 - A mock transcript proves plumbing, not speech-recognition accuracy.
 
 When in doubt, distinguish these three words:
