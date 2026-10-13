@@ -1,0 +1,914 @@
+# Codebase guide: from one PCM chunk to a shared Qwen worker
+
+This is a source-reading guide for the current **`qwen_stream` C/C++ implementation**. It progresses from a beginner mental model to process/thread ownership, protocol details and debugger work. [Architecture](ARCHITECTURE.md) is the concise reference; [report.md](../report.md) contains measured results.
+
+**Scope:** production CLI/service, PCM simulator, transport, shared resumable engine, CPU native inference, storage/telemetry and dashboard. Native/prefix alternatives appear only where they explain runtime dispatch. Test programs, mock engines, synthetic-source walkthroughs, Python experiment suites and GPU implementations are excluded. The C++ WAV simulator under `src/benchmark/` is included because `load` and REST suites use it to send real audio; it is not a Python inference path.
+
+## Contents
+
+1. [The one-minute mental model](#1-the-one-minute-mental-model)
+2. [Vocabulary, ownership and identities](#2-vocabulary-ownership-and-identities)
+3. [Startup: who creates the models and processes](#3-startup-who-creates-the-models-and-processes)
+4. [The complete live request flow](#4-the-complete-live-request-flow)
+5. [Direct and network WAV flows](#5-direct-and-network-wav-flows)
+6. [Call-stack trees](#6-call-stack-trees)
+7. [How routing and priority actually work](#7-how-routing-and-priority-actually-work)
+8. [Multiplexing and native state](#8-multiplexing-and-native-state)
+9. [Sockets and chunk transfer](#9-sockets-and-chunk-transfer)
+10. [The interfaces](#10-the-interfaces)
+11. [Modules and every relevant source file](#11-modules-and-every-relevant-source-file)
+12. [Build and run](#12-build-and-run)
+13. [Follow a real call in a debugger](#13-follow-a-real-call-in-a-debugger)
+14. [Reading paths and common mistakes](#14-reading-paths-and-common-mistakes)
+
+## 1. The one-minute mental model
+
+> Audio enters a call session. A session remembers that call's progress. A worker owns model weights and chooses a ready session to compute. A completed compute turn emits text and returns the worker to the scheduler.
+
+The application has **three independent choices**:
+
+| Choice | Example | What it controls |
+|---|---|---|
+| Model | `models/qwen3-asr-0.6b` | Which learned weights are loaded |
+| Runtime | `qwen_stream` | How those weights are executed and session state is retained |
+| Transport | `direct` or `network` | Whether PCM reaches the engine through function calls or WebSockets |
+
+Changing transport does not select a different model. Changing language selects a per-call language prompt, not a separately loaded English/Chinese/Indonesian model.
+
+There is one user-facing C++ executable: **`asr-cli`**. `serve` and `load` are subcommands, not separate executables. **`asr-prefix-worker`** is a helper executable used for shared workers when more than one process is requested; its legacy name also serves the resumable runtime. The UI is a separate browser application.
+
+For `qwen_stream`:
+
+- **One worker:** model and inference thread live inside `asr-cli`.
+- **Two workers:** `asr-cli` starts two persistent `asr-prefix-worker` processes. Each loads one model context.
+- **Two sessions per worker:** four live calls can be admitted. Only one decode turn runs per worker, so at most two worker jobs compute concurrently.
+- **Four threads per worker:** numerical kernels can use four compute threads for that one job. A thread is not a call and not a worker process.
+
+```text
+service process
+  pool/router
+    worker 0 process: shared weights + state A + state C -> one ready step at a time
+    worker 1 process: shared weights + state B + state D -> one ready step at a time
+```
+
+The most useful files to start with are `engine_runtime.cpp`, `prefix_pool.cpp`, `prefix_engine.cpp` and `websocket.cpp`. Their exact locations and responsibilities are catalogued in Section 11.
+
+## 2. Vocabulary, ownership and identities
+
+### 2.1. The objects you will see
+
+| Object | Plain meaning | Lifetime / owner |
+|---|---|---|
+| `RunConfig` | Validated startup settings | CLI/service, copied into a suite's effective configuration |
+| `IASREngine` | A factory that accepts call sessions | Service or CLI load command |
+| `IASRSession` | One call's submit/EOF/cancel handle | Browser connection handler or C++ call runner |
+| `PrefixProcessPool` | Routes calls to persistent worker processes | Multi-worker shared engine |
+| `PrefixProcess` | Parent's handle to one child, its socket and call map | Process pool |
+| `PrefixMultiplexEngine` | Shared engine implementation inside a worker | Service for one worker; child for multiple workers |
+| `PrefixShared` | Model, locks, inference thread and call states | Shared engine |
+| internal `Call` | PCM, language, decoder state, timestamps and result lifecycle | Shared engine's call vector |
+| `qwen_resumable_state` | Persistent native encoder/decoder progress | One internal call |
+| `IRecognitionSink` | Receiver of transcript events and runtime observations | Outlives the session using it |
+
+A **process** has its own memory space. A **thread** runs inside a process and shares its memory. A **session** is a logical call, not necessarily a thread. A **job** is one selected compute turn. The C++ WAV runner also creates producer threads to emulate simultaneous incoming calls; those are separate from worker compute threads.
+
+Several helper types have similar names in different files:
+
+| Helper | File | What it holds |
+|---|---|---|
+| internal `Call` | `prefix_engine.cpp` | Actual worker PCM and native resumable state |
+| helper `Call : IRecognitionSink` | `apps/asr_prefix_worker/main.cpp` | Child session handle and forwarding callbacks |
+| `RemoteCall` | `prefix_pool.cpp` | Parent configuration, sink pointer, snapshot and terminal/reply bookkeeping |
+| pool `RemoteSession` | `prefix_pool.cpp` | Parent-side IASRSession proxy to a worker child |
+| WebSocket `RemoteSession` | `websocket.cpp` | Client-side IASRSession proxy to a WebSocket listener |
+
+These are layered wrappers for the same logical call, not five different audio calls. Only the worker's internal `Call` owns native decoding state.
+
+### 2.2. IDs are not converted into model numbers
+
+| Identifier | Example shape | Purpose |
+|---|---|---|
+| `recording_id` | `fleurs_en_us_validation_1523_142` | Dataset WAV/reference identity; can be reused by many calls |
+| REST `job_id` | `job_<time>_<random>` | Track an asynchronous suite request |
+| Suite ID | `load_<time>_<random>` | Group WAV call runs and artifacts |
+| Planned call ID | `repeat_0_call_0` | Position/repetition inside a load plan |
+| `run_id` in an actual load call | `<suite_id>_<planned_call_id>` | Uniquely identifies one artifact-producing call run |
+| actual `call_id` | `<run_id>_call_0` | Session identity used throughout submit, results and routing |
+| Browser `run_id` | `ui_<crypto.randomUUID()>` | Identifies an interactive browser run |
+| Browser `call_id` | `<browser_run_id>_call_0` | Interactive session identity |
+| shared `worker_id` | `prefix_shared_0`, `prefix_shared_1` | Worker assignment, retained despite runtime's newer name |
+| process ID | Linux PID | OS process; unrelated to call identity |
+| `engine_id` | `qwen_stream_shared` / `qwen_stream_process_pool` | Implementation capability label, not a unique model replica ID |
+| `producer_id` | `qwen_prefix_multiplex` | Retained producer label in shared events; not the routing key |
+| IPC `request` | Increasing integer per child connection | Match an RPC reply to its request, not identify a call |
+| chunk `sequence` | 0, 1, 2… | Check PCM message order inside one call |
+| `first_sample` | 0, 3200, 6400… | Audio sample offset, not a timestamp |
+| event `sequence` / `revision` | Increasing per call | Recognition-event order and transcript updates |
+
+`new_run_id()` in `repository.cpp` combines a prefix, system-clock value and random values. `frontend/src/stream.ts` uses a UUID. In `load.cpp`, the suite ID is joined with the planned call ID. `run_baseline()` then constructs `<run_id>_call_0`. The simulator happens to run one session in each per-call artifact run; the `_call_0` suffix does not mean only one call can exist in the service.
+
+The shared pool rejects duplicate **active `call_id` values across its workers**, even if callers supply different `run_id` values. The worker child and its engine also check duplicate active IDs. The WebSocket observation feed uses the combined `run_id/call_id` key. Consequently, clients should generate globally unique call IDs for each new logical call, rather than rely on a dataset filename or a model name.
+
+Audio and result events carry identities; they are not routed just by language. Two English calls remain separate even when both use the same WAV and shared weights. A call's `worker_id` is assigned at admission and its affinity remains fixed.
+
+### 2.3. One model family, multiple replicas and private call state
+
+Two workers do not automatically mean two different ASR models. Both use the startup `model.path`. Each process loads a context for the same Qwen weights. Model mappings may share physical file-backed pages within the OS, but C++ pointers/call caches are process-local. There is no distributed shared-memory decoder.
+
+There is no per-call “select model A/model B” router. `make_engine()` chooses the runtime once from startup configuration. `validate_shared_suite()` prevents REST requests from replacing the loaded model, changing workers/threads/slots or changing immutable decoding policy. Supported per-call decode-step controls do not reload weights. Different independently configured model services would be needed for actual multi-model routing.
+
+## 3. Startup: who creates the models and processes
+
+Read `apps/asr_cli/main.cpp` → `apps/asr_cli/service.cpp` → `apps/asr_cli/engine_runtime.cpp`.
+
+1. `main()` parses the subcommand, config path, manifest and `--set` overrides.
+2. `resolve_config()` merges YAML/defaults/overrides, validates runtime settings and resolves paths. Model/output paths are resolved against the configuration location; use an absolute path when removing ambiguity.
+3. Manifest preparation reads WAVs/references and prepares PCM when the command requires it.
+4. `serve` calls `asr::app::run_service()`.
+5. `run_service()` calls `make_engine(config)` **before** opening the service listener.
+6. `make_engine()` creates `SharedStreamOptions`, with `enabled=true` for `qwen_stream`.
+7. With more than one configured worker, the factory constructs `PrefixProcessPool`. With one worker, it directly constructs `PrefixMultiplexEngine`.
+8. A multi-worker pool constructs one `PrefixProcess` for each worker index. That constructor calls **`socketpair()` and `posix_spawn()`**. The scheduler does not spawn processes.
+9. The child executable receives model path, slots, thread/deadline settings, worker ID and streaming options. It constructs its own `PrefixMultiplexEngine`.
+10. `PrefixShared` sets runtime/BLAS thread budgets, calls `qwen_load()`, records model-load time and starts an **inference thread** running `loop()`.
+11. The child sends `boot` through local IPC. The parent waits for successful boot before exposing ready worker capacity.
+12. The service constructs `ApiService`, its admission gate and public `WebSocketServer`, then prints the loopback address and actual port.
+
+`native_runtime_owner` permits one shared Qwen owner in a process because the pinned native runtime has mutable process-global settings. REST suites reuse the existing shared engine instead of loading another independent shared context into that process.
+
+The native alternative takes a different branch: `SessionManager` + `FactoryWorkerExecutor` + `NativeQwenEngine`. It is not the shared runtime's scheduling path.
+
+## 4. The complete live request flow
+
+This is a real browser/external PCM call to the public `serve` listener.
+
+| Step | Caller / location | What happens |
+|---|---|---|
+| 1 | `StreamingPanel.tsx` → `wav.ts` | Read/validate the selected PCM WAV and create a streaming controller |
+| 2 | `PacedStream` in `stream.ts` | Generate run/call IDs and open `/v1/asr`; observer opens `/v1/observe` |
+| 3 | `WebSocketServer::accept_loop()` | Accept a TCP connection and create a handler thread |
+| 4 | `WebSocketServer::handle_client()` | Parse HTTP upgrade and the versioned `start` JSON |
+| 5 | transport validation | Validate identities, sample rate, chunk limit and optional decode controls |
+| 6 | `ServiceAdmissionGate` | Reject interactive admission while an exclusive REST suite owns the service |
+| 7 | `engine_.create_session()` | Delegate to the selected shared engine or process pool |
+| 8 | pool admission for multiple workers | Reserve a healthy free slot using least-active/round-robin routing |
+| 9 | pool `rpc(create)` → child | Child creates a private session state using the same shared weights |
+| 10 | server `ready` frame | Return worker ID and one PCM credit to the caller |
+| 11 | browser pacing | Send `chunk` metadata followed by a binary little-endian PCM16 frame |
+| 12 | server chunk validation | Check sequence, sample offset and payload length, then construct `AudioChunk` |
+| 13 | `session->submit()` | In-process: call `PrefixSession::submit`; pool: send an `audio` IPC RPC |
+| 14 | worker `PrefixSession::submit()` | Check IDs/order/format, convert PCM16 to floats, append audio, mark readiness and wake inference |
+| 15 | worker `loop()` → `select()` | Choose one ready call and prepare a bounded next-step job |
+| 16 | `qwen_resumable_step()` | Advance that call's state; copy accumulated text into a C++ event |
+| 17 | sink/event delivery | Parent demultiplexes child event by call ID, then `ServerSink` sends it on the call's WebSocket |
+| 18 | browser `PacedStream` | Update revisions, transcript and arrival metrics; reject stale observer revisions |
+| 19 | browser EOF | Send expected next chunk sequence and total sample count |
+| 20 | `finish_input()` | Mark EOF and wait while worker drains remaining quanta; deliver final event then protocol `done` |
+| 21 | session destruction | Remove call state and release reserved slot; weights remain loaded |
+
+A chunk acknowledgement confirms `submit()` accepted that chunk. It does **not** mean that audio has already been transcribed. PCM intake can continue while the inference thread computes.
+
+The event sink differs by entry point. A public live WebSocket uses `ServerSink` plus the in-memory observation feed. The C++ WAV runner creates `FileResultRepository` and persists per-call artifacts. Do not assume every external live connection automatically creates the same per-call disk directory as a `load` run.
+
+## 5. Direct and network WAV flows
+
+### 5.1. CLI `load --mode direct`
+
+`main()` constructs the real engine and calls `run_load()`. The runner launches up to `concurrency` producer threads. Each producer picks an input call, constructs a WAV buffer source, clock and file repository, then invokes `run_baseline()`.
+
+`run_baseline()` creates one session, runs `PacedAudioStream`, submits each ready `AudioChunk`, calls `finish_input()`, validates the final state and writes summaries. `RepositorySink` receives events/observations while that is happening.
+
+**Direct skips the WebSocket layer.** With multiple workers, local worker IPC still exists. Direct does not mean all work runs in one process, and does not mean the full WAV is decoded immediately without pacing.
+
+### 5.2. CLI `load --mode network`
+
+The CLI constructs a private `WebSocketServer` around the same actual engine, using an available loopback port. It wraps that port in `WebSocketEngine`. `run_load()` receives the wrapper as its `IASREngine`.
+
+The call runner stays the same. Virtual dispatch changes:
+
+```text
+direct:  run_baseline -> actual shared engine create_session/submit
+network: run_baseline -> WebSocketEngine -> TCP/WebSocket -> actual shared engine
+```
+
+`asr-cli load --mode network` starts its own private listener. It does **not** automatically connect to an already running UI server on port 8081.
+
+### 5.3. REST `/v1/suites` on an existing service
+
+1. The public listener routes the HTTP request to `ApiService::handle()`.
+2. The API assigns a `job_id`, checks suite admission and starts a job thread.
+3. That thread invokes the callback installed by `run_service()`.
+4. The callback resolves request overrides, validates immutable shared settings and prepares `LoadSpec`/`LoadPlan`.
+5. It reuses the startup shared engine.
+6. Direct mode passes that engine to `run_load()`.
+7. Network mode creates a **temporary internal listener** around it and supplies `WebSocketEngine` to `run_load()`.
+8. The API returns a job result/suite artifact location when execution finishes.
+
+The public service port accepts the REST request, but the generated network PCM clients connect to the temporary listener's port. That internal listener has no interactive admission gate of its own; the outer gate blocks competing public live sessions while a suite runs. This preserves the exclusive suite boundary while allowing its own internal network clients.
+
+## 6. Call-stack trees
+
+These are **causal call trees**, not one uninterrupted stack. Arrows marked `[thread]`, `[IPC]` or `[socket]` cross execution boundaries; a debugger's `bt` shows only the currently selected thread/process.
+
+### 6.1. Startup
+
+```text
+main                                     apps/asr_cli/main.cpp
+└─ run_service                           apps/asr_cli/service.cpp
+   ├─ make_engine                        apps/asr_cli/engine_runtime.cpp
+   │  ├─ [1 worker] PrefixMultiplexEngine
+   │  │  └─ PrefixShared
+   │  │     ├─ qwen_load
+   │  │     └─ [thread] PrefixShared::loop
+   │  └─ [multiple workers] PrefixProcessPool
+   │     └─ PrefixProcess × worker count
+   │        ├─ socketpair
+   │        ├─ posix_spawn(asr-prefix-worker)
+   │        └─ [child] main
+   │           └─ PrefixMultiplexEngine -> PrefixShared -> qwen_load + inference thread
+   ├─ ApiService(callbacks)
+   └─ WebSocketServer -> [thread] accept_loop -> [thread] handle
+```
+
+### 6.2. Direct call, one worker
+
+```text
+run_load -> [producer thread]
+└─ run_baseline
+   ├─ PrefixMultiplexEngine::create_session -> PrefixSession
+   ├─ PacedAudioStream::produce_ready / pop
+   ├─ PrefixSession::submit -> append floats + notify wake
+   │  └─ [inference thread] PrefixShared::loop
+   │     ├─ select -> select_prefix_job
+   │     ├─ qwen_resumable_create             first decode turn only
+   │     ├─ qwen_resumable_step               repeat once per selected quantum
+   │     ├─ qwen_resumable_text
+   │     └─ RepositorySink::on_event / on_observation
+   └─ PrefixSession::finish_input -> wait -> final -> repository.finish
+```
+
+### 6.3. One chunk, multiple workers
+
+```text
+caller's IASRSession::submit
+└─ RemoteSession::submit                    prefix_pool.cpp
+   └─ selected PrefixProcess::rpc(audio)
+      └─ [Unix socket] child main receives command
+         └─ child's calls[call_id].session->submit
+            └─ PrefixSession::submit -> wake
+               └─ [child inference thread] PrefixShared::loop -> qwen_resumable_step
+                  └─ child Call::on_event -> prefix_wire::send(fd 3)
+                     └─ [parent reader thread] PrefixProcess::read_loop
+                        └─ calls[event.call_id].sink->on_event
+```
+
+### 6.4. Network wrapper around the same chunk
+
+```text
+run_baseline
+└─ WebSocketEngine::create_session
+   └─ WebSocket RemoteSession                websocket.cpp; different class from pool RemoteSession
+      ├─ JSON chunk header + binary PCM -> [TCP socket]
+      └─ server handle -> actual engine session->submit
+         └─ previous shared engine / child tree
+```
+
+### 6.5. Native numerical work
+
+```text
+PrefixShared::loop
+└─ qwen_resumable_step                      generated qwen_asr.c
+   ├─ audio features / mel frames
+   ├─ reuse completed encoder windows or qwen_encode remaining window
+   ├─ decoder prefill reuse / qwen_decoder_prefill as needed
+   ├─ token generation -> qwen_decoder_forward
+   └─ token-history rollback / text update / cursor advance
+```
+
+The last tree is conceptual: branches/caching depend on current state. Model layers call CPU kernels/OpenBLAS internally. It is not a promise that every kernel runs on every turn.
+
+## 7. How routing and priority actually work
+
+### 7.1. Two scheduling decisions
+
+| Decision | Responsible code | Inputs | Output |
+|---|---|---|---|
+| Which worker receives a new call? | `PrefixProcessPool::create_session` | Worker health, reserved-call counts, slot limits, configured policy and rotating tie-break cursor | One worker / affinity assignment |
+| Which admitted call runs next? | `PrefixShared::select` + `select_prefix_job` | Available audio, EOF/expiry, busy/terminal/cancelled flags and readiness timestamps | One compute job |
+
+`src/backend/scheduler/scheduler.cpp` defines generic schedulers used by `SessionManager` in the native alternative. **The resumable shared factory returns before constructing that manager.** Its worker selection is implemented in `prefix_pool.cpp`, not through the generic scheduler interface. Opening only `scheduler.cpp` will miss the main shared admission algorithm.
+
+### 7.2. Admission algorithm in the process pool
+
+Under the pool lock, scan workers starting from `tie_break_`:
+
+```text
+reject duplicate active call_id
+ignore unhealthy worker
+ignore worker whose owned-call map has reached its slot limit
+score = owned-call count for least_active
+score = scan position for round_robin
+choose lowest score
+reserve call in chosen worker.calls BEFORE IPC create
+advance tie_break_ to worker after chosen worker
+release pool lock
+send child create RPC
+if child create fails, remove reservation
+return RemoteSession on success
+```
+
+The pool's owned-call count includes a session until it is destroyed/dropped. A published final event does not alone erase the parent reservation. This matters when a client rapidly replaces completed calls: lifecycle cleanup and admission timing are separate from token decoding.
+
+Example with two workers/two slots: starting empty, least-active routing can assign A→0, B→1, C→0, D→1. Ties rotate; IDs do not determine priority. A fifth call is rejected while all four slots are reserved. There is no unlimited pending-call admission queue.
+
+### 7.3. Ready-call algorithm inside a worker
+
+A normal call is ready when:
+
+```text
+received sample count >= decoded cursor + decode_step_ms × 16
+```
+
+The factor 16 is 16,000 samples/s divided by 1,000 ms/s. At 2,000 ms, one quantum is 32,000 samples. EOF allows the final partial quantum even if it is shorter.
+
+`select()` skips busy/cancelled/terminal calls. It checks total deadline and pre-EOF idle deadline. Expired calls form a higher-priority class so they can be retired without expensive inference. Remaining resumable calls all use the same scheduling class; their effective ready key includes step readiness and EOF receipt timestamps. `select_prefix_job()` chooses the oldest key in that class. A rotating scan cursor supplies tie order.
+
+After a turn, the call's cursor/counters are updated. If audio/EOF still makes it ready, `step_ready_ns` is set to decode-finish time. This moves it behind already-waiting calls. There is no customer priority number, language priority or “shortest file first” policy.
+
+For the legacy prefix runtime only, previews and EOF refinement are separate classes and two previews may bypass a waiting EOF. In resumable mode the ready-job `final` class flag is false; that legacy bypass rule does not give EOF a separate privileged class.
+
+### 7.4. Intake and decode backlogs are different
+
+`submit()` appends incoming audio; it does not synchronously decode all of it. The producer can therefore keep delivering while the model falls behind. Delivery lag/PCM queue limits measure transport pacing; the decoder cursor measures recognition progress. After EOF, remaining ready quanta are processed until finalization.
+
+A 500 ms audio quantum taking more than 500 ms of computation can create backlog even with one call. With multiple calls, the worker alternates their quanta and queue waiting increases. Changing a PCM chunk from 200 to 100 ms does not double compute capacity or automatically change the decode step.
+
+## 8. Multiplexing and native state
+
+### 8.1. What is shared and what is saved
+
+`PrefixShared` owns `qwen_ctx_t model` and one inference thread. Each internal `Call` owns a `unique_ptr<qwen_resumable_state>` plus its audio and metadata. The generated state shallow-copies the weight-bearing context but resets/allocates private mutable buffers. Its destructor frees private state without invoking the parent's weight destructor. The parent model outlives every child state.
+
+State includes encoder window cache, decoder KV/prefill capacity, language/tokenizer metadata, raw/stable/emitted token history, audio cursor, chunk index and accumulated text. Caches are associated with the call object, not temporarily indexed only by whichever job happens to run next.
+
+```text
+worker turn 1: A(state A, weights W) -> save state A
+worker turn 2: B(state B, weights W) -> save state B
+worker turn 3: A(state A, weights W) -> continue A
+```
+
+This is **time multiplexing**: calls take turns. Tensor batching would put several calls into one numerical operation; this implementation does not do that.
+
+### 8.2. One native turn
+
+`select()` copies cumulative audio up to `min(received, cursor + step)` into `Job.samples`. PCM16 has already been normalized to float. `loop()` lazily creates native state using the call's language/step, invokes `qwen_resumable_step`, copies its text and reads cursor/counters.
+
+Native `step` returns 0 when it needs more audio, 1 after progressing, 2 after finalization, or a negative value on failure/interruption. The generated code retains native window/caching/rollback behavior and limits the call to one iteration per scheduler turn.
+
+Completed encoder windows and unchanged decoder prefills can be reused. The growing partial window can still be recomputed. Thus resumable does not mean zero repeated computation. Cumulative job audio copying and temporary native work remain optimization opportunities.
+
+Optional `refine_final=true` adds a full-audio decode at finalization. The current fast preset uses false. Initial withheld chunks, rollback and token limits influence early-text quality independently of scheduling. The supported resumable API/configuration step range is 500–8,000 ms; the native alternative retains a 1,000 ms minimum. The current streaming-panel dropdown exposes 1,000/2,000/4,000/8,000 ms for this mode, so accepting 500 ms in the backend does not imply it is offered as a UI option.
+
+### 8.3. Thread and lock boundaries
+
+- Producer/connection threads append PCM under the worker mutex.
+- The inference thread chooses a job under that mutex, then releases it for numerical work.
+- `busy` prevents competing access/destruction of the selected call while the model works.
+- Result delivery uses the call's sink after state is updated; terminal completion coordinates with a condition variable.
+- EOF/cancel waits release the mutex while waiting. The worker helper handles potentially blocking EOF/cancel RPCs in operation threads so its ingress can still accept other calls' PCM.
+- Parent reader threads receive events/replies independently of producer threads waiting for an RPC reply.
+
+Sink/clock lifetimes must cover session callbacks. Session destruction waits until the worker is no longer using its call state, then removes it. Engine destruction joins the inference thread and clears private call states before freeing model weights.
+
+## 9. Sockets and chunk transfer
+
+### 9.1. Two entirely different socket layers
+
+| Layer | Socket type | When used | Payload |
+|---|---|---|---|
+| Browser/C++ network client → service listener | Loopback TCP (`AF_INET`, `SOCK_STREAM`), HTTP upgrade to WebSocket | Every browser call; simulated `mode=network` | JSON control frames, binary PCM16 frames, JSON results |
+| Shared controller → worker child | Local Unix `socketpair(AF_UNIX, SOCK_STREAM)` | More than one shared worker, in either direct or network mode | Length-prefixed JSON commands/replies/events; PCM encoded as JSON integer array |
+
+**Direct + two workers still uses Unix IPC.** **Network + one worker still uses WebSocket TCP**, but does not spawn a shared worker child. These choices are orthogonal.
+
+### 9.2. WebSocket conversation
+
+```text
+client -> server: HTTP Upgrade /v1/asr
+client -> server: {v:1,type:start,run_id,call_id,language,...}
+server -> client: {type:ready,status,worker_id,credits:1}
+client -> server: {type:chunk,sequence:0,first_sample:0,sample_count:3200,...}
+client -> server: binary frame: 6,400 bytes of little-endian PCM16
+server -> client: {type:ack,sequence:0,status,credits:1}
+server -> client: {type:event,event:{call_id,kind:partial,text,...}}  whenever ready
+... more chunks / acknowledgements / events ...
+client -> server: {type:eof,expected_next_sequence,total_samples}
+server -> client: final event
+server -> client: {type:done,status}
+```
+
+JSON and binary frames for a chunk are serialized together by the C++ client sender. The server validates the binary frame length `sample_count × 2`. `first_sample` must match its running sample count. No call ID is repeated in each PCM binary payload: the authenticated/validated start metadata has already associated that connection with one session; each reconstructed `AudioChunk` receives those IDs.
+
+The single-credit protocol bounds outstanding chunk submission. The C++ network `RemoteSession` has a reader thread for acknowledgements/events/observations and waits for the matching acknowledgement in `submit()`. Transcript events can arrive between acknowledgements.
+
+`/v1/observe` is a secondary observation/replay channel. The UI deduplicates revisions because events may be seen through both its main audio socket and observer. Observation buffering is distinct from the model's private state.
+
+### 9.3. Worker IPC conversation
+
+`PrefixProcess` creates the local socket pair, maps the child's end to **file descriptor 3** with spawn file actions, then launches `asr-prefix-worker`. `process_wire.hpp` sends a four-byte length followed by JSON text; the frame limit is 1 MiB. The length is local native representation, not a public cross-platform network format.
+
+```text
+parent -> child: {op:create,request:17,run_id:R,call_id:C,language:en,...}
+child  -> parent: {type:reply,request:17,status,...}
+parent -> child: {op:audio,request:18,call_id:C,sequence:0,first_sample:0,pcm:[...],...}
+child  -> parent: {type:reply,request:18,status,...}
+child  -> parent: {type:event,call_id:C,run_id:R,kind:...,text:...}
+parent -> child: {op:eof,request:19,call_id:C}
+child  -> parent: observations, final event, then reply for request 19
+parent -> child: {op:drop,request:20,call_id:C}  when remote session is destroyed
+```
+
+Worker replies are matched by `request`; asynchronous events are matched by `call_id`. The parent's `calls` map supplies the original sink. PCM is copied/serialized across this boundary, not shared by a raw C++ pointer. There is no HTTP/WebSocket handshake between parent and child.
+
+### 9.4. Why a full slot error can occur after final text
+
+The parent reservation, child call map and worker state are released by session destruction/`drop`, not by the final text alone. Therefore a final event, an EOF RPC acknowledgement and the destruction of the session handle are related but distinct moments. The report's observed network admission failures should be investigated along those boundaries rather than assumed to be model errors.
+
+## 10. The interfaces
+
+Read headers before implementations. `I...` denotes a contract implemented by another class; virtual dispatch selects the actual implementation through a pointer/reference.
+
+| Contract | Main operations | Why it exists |
+|---|---|---|
+| `IASREngine` | `capabilities()`, `create_session(config,sink,clock)` | Same producer/transport code can use shared, native or network wrapper engines |
+| `IASRSession` | `submit(AudioChunk)`, `finish_input()`, `cancel(reason)`, `snapshot()` | Call lifetime and media operations without exposing vendor state |
+| `IRecognitionSink` | `on_event`, `on_observation` | Results flow back without model code depending on browser/files |
+| `IAudioSource` | `read(max_samples)` | Runner gets PCM without depending on WAV file layout |
+| `IResampler` | resample operation | Input normalization separated from WAV parsing |
+| `IClock` | monotonic now, sleep-until, domain, UTC | Pacing and measurements share explicit timestamp boundaries |
+| `IResultRepository` | begin, append events/audio/records, finish | Artifact publication separated from inference |
+| `ISystemSampler` | sample process/host resources | Linux telemetry separated from recognition algorithms |
+| `IHttpHandler` | handle request → response | REST API separated from listener/HTTP parsing |
+| `IWorkerExecutor` / `IWorkerScheduler` | construct engine / select slot | Native session-manager path, not the shared pool's per-step implementation |
+
+`Status` has an error code/message and boolean success semantics. `Result<T>` pairs status with a value. `AudioChunk`, `SessionConfig`, `SessionSnapshot`, `RecognitionEvent` and `RuntimeObservation` are value structures in `core/types.hpp`, without native Qwen types. `PcmBuffer` is shared immutable PCM16 ownership; submitting a chunk does not transfer a pointer across an OS process boundary.
+
+`unique_ptr` means one owner; destruction releases it. `shared_ptr` means several in-process owners; it does not share address-space objects between processes. `mutex` protects concurrent access. `condition_variable` permits waiting until work/state changes without continuously spinning. RAII means destructors perform cleanup even on exceptions.
+
+## 11. Modules and every relevant source file
+
+The catalog below covers every project production source/header in `apps/`, `src/` and `frontend/src/` after removing mock implementations and test files. Supporting build/configuration and native CPU files follow. One header plus one `.cpp` is not two independent modules: the header declares the contract, and the `.cpp` normally implements it.
+
+### CLI and runtime selection
+
+| File | What to read / responsibility |
+|---|---|
+| [apps/asr_cli/main.cpp](../apps/asr_cli/main.cpp) | Parses commands/overrides, prepares media and chooses serve, single-call or C++ load execution. The load branch inserts the WebSocket adapter only for network mode. |
+| [apps/asr_cli/engine_runtime.hpp](../apps/asr_cli/engine_runtime.hpp) | Declares make_engine, draining/status helpers and shared-suite startup-policy validation. |
+| [apps/asr_cli/engine_runtime.cpp](../apps/asr_cli/engine_runtime.cpp) | Factory and adapter selection. Shared modes return a shared engine/pool directly; native mode uses the generic session manager/executor/scheduler. |
+| [apps/asr_cli/service.hpp](../apps/asr_cli/service.hpp) | Declares run_service and the service entry contract used by CLI main. |
+| [apps/asr_cli/service.cpp](../apps/asr_cli/service.cpp) | Constructs the long-lived engine, admission gate and public listener; installs REST suite/runtime callbacks and reuses shared weights across suite jobs. |
+| [apps/asr_prefix_worker/main.cpp](../apps/asr_prefix_worker/main.cpp) | Child-process boot and command loop on FD 3. Maps call IDs to session handles; forwards audio, EOF/cancel/drop and asynchronous result callbacks. |
+| [apps/asr_native_worker/main.cpp](../apps/asr_native_worker/main.cpp) | Alternate native child entry: model load, progressive native recognition, callback output and final behavior. Not the shared per-call step scheduler. |
+
+### Core values and clocks
+
+| File | What to read / responsibility |
+|---|---|
+| [src/core/include/asr/core/types.hpp](../src/core/include/asr/core/types.hpp) | Status/Result, PCM ownership, call configuration/state, audio chunks, transcript events, runtime observations and engine capabilities. |
+| [src/core/include/asr/core/clock.hpp](../src/core/include/asr/core/clock.hpp) | IClock and the real SteadyClock used for paced calls. Read monotonic now/sleep-until/UTC conversion; synthetic timing helpers are outside this walkthrough. |
+| [src/core/include/asr/core/chunk_schedule.hpp](../src/core/include/asr/core/chunk_schedule.hpp) | Sample-count/deadline arithmetic for splitting audio into chunks and deriving readiness times. |
+| [src/core/include/asr/core/utf8.hpp](../src/core/include/asr/core/utf8.hpp) | Validates complete UTF-8 prefix boundaries so token-byte fragments do not corrupt published text. |
+
+### Audio preparation and real PCM delivery
+
+| File | What to read / responsibility |
+|---|---|
+| [src/audio/include/asr/audio/source.hpp](../src/audio/include/asr/audio/source.hpp) | IAudioSource contract. The guide follows real buffered WAV PCM through this interface. |
+| [src/audio/include/asr/audio/wav.hpp](../src/audio/include/asr/audio/wav.hpp) | WAV metadata, PreparedAudio, channel mixing, IResampler/SincResampler and BufferPcmSource declarations. |
+| [src/audio/src/wav.cpp](../src/audio/src/wav.cpp) | Reads/validates WAV chunks, prepares mono 16 kHz PCM, performs documented resampling/mixing and implements buffer reads. |
+| [src/audio/include/asr/audio/delivery.hpp](../src/audio/include/asr/audio/delivery.hpp) | PacedAudioStream state machine, delivery limits/statistics and chunk timing structures. |
+| [src/audio/src/delivery.cpp](../src/audio/src/delivery.cpp) | Maintains absolute media deadlines, bounded PCM queues, ordered pop/EOF and explicit lag/overflow failures. |
+
+### Shared resumable runtime: primary reading path
+
+| File | What to read / responsibility |
+|---|---|
+| [src/engines/interfaces/include/asr/engines/engine.hpp](../src/engines/interfaces/include/asr/engines/engine.hpp) | IASREngine, IASRSession and IRecognitionSink. Transport/simulator code depends on these, not vendor model structs. |
+| [src/engines/prefix/include/asr/engines/prefix_engine.hpp](../src/engines/prefix/include/asr/engines/prefix_engine.hpp) | SharedStreamOptions, worker/call status and PrefixMultiplexEngine interface; the same engine supports resumable and prefix policies. |
+| [src/engines/prefix/src/prefix_engine.cpp](../src/engines/prefix/src/prefix_engine.cpp) | Private Call/PrefixShared/PrefixSession implementation. Owns weights, inference thread, ready-job selection, PCM conversion, native state, sink callbacks and cleanup. |
+| [src/engines/prefix/include/asr/engines/prefix_scheduler.hpp](../src/engines/prefix/include/asr/engines/prefix_scheduler.hpp) | Small inline ready-job selector. Expiry first; class/oldest-ready ordering. Legacy EOF bypass is distinct from resumable step scheduling. |
+| [src/engines/prefix/include/asr/engines/prefix_pool.hpp](../src/engines/prefix/include/asr/engines/prefix_pool.hpp) | Persistent process-pool interface, worker status and admission-policy/tie-break fields. |
+| [src/engines/prefix/src/prefix_pool.cpp](../src/engines/prefix/src/prefix_pool.cpp) | Spawns workers, implements Unix RPC/readers, routes calls, reserves/releases slots and demultiplexes replies/events. |
+| [src/engines/prefix/src/process_wire.hpp](../src/engines/prefix/src/process_wire.hpp) | Local length-prefixed JSON I/O and serialization for status, call events, observations and worker snapshots. |
+
+### Alternate native runtime and generic worker lifecycle
+
+| File | What to read / responsibility |
+|---|---|
+| [src/engines/native/include/asr/engines/native_engine.hpp](../src/engines/native/include/asr/engines/native_engine.hpp) | NativeQwenOptions and NativeQwenEngine interface for the one-active-call native path. |
+| [src/engines/native/src/native_engine.cpp](../src/engines/native/src/native_engine.cpp) | Creates/supervises native helper execution, forwards PCM, reads progressive output and enforces native deadlines. |
+| [src/engines/native/src/wire.hpp](../src/engines/native/src/wire.hpp) | Native helper wire framing/status helpers. Separate protocol from shared process_wire.hpp. |
+| [src/backend/workers/include/asr/backend/executor.hpp](../src/backend/workers/include/asr/backend/executor.hpp) | IWorkerExecutor/FactoryWorkerExecutor declarations for constructing independently owned native engines. |
+| [src/backend/workers/src/executor.cpp](../src/backend/workers/src/executor.cpp) | Factory-backed engine creation; it is not where shared worker posix_spawn occurs. |
+| [src/backend/scheduler/include/asr/backend/scheduler.hpp](../src/backend/scheduler/include/asr/backend/scheduler.hpp) | Generic WorkerSnapshot and scheduler interfaces used by SessionManager. |
+| [src/backend/scheduler/src/scheduler.cpp](../src/backend/scheduler/src/scheduler.cpp) | Generic least-active/round-robin slot selection. Read for native path; shared admission is in prefix_pool.cpp. |
+| [src/backend/sessions/include/asr/backend/session_manager.hpp](../src/backend/sessions/include/asr/backend/session_manager.hpp) | WorkerLayout and SessionManager lifecycle/routing contract for isolated engine owners. |
+| [src/backend/sessions/src/session_manager.cpp](../src/backend/sessions/src/session_manager.cpp) | ManagedSession wrapper, native slot assignment/generation IDs, lifecycle/expiry/drain handling and release. |
+
+### Transport and public service control
+
+| File | What to read / responsibility |
+|---|---|
+| [src/backend/transport/include/asr/backend/websocket.hpp](../src/backend/transport/include/asr/backend/websocket.hpp) | HTTP handler/request/response types, public WebSocketServer and network IASREngine adapter declarations. |
+| [src/backend/transport/src/websocket.cpp](../src/backend/transport/src/websocket.cpp) | TCP listener/HTTP upgrade, main PCM session protocol, observer feed, ServerSink, network RemoteSession and JSON/binary frame validation. |
+| [src/backend/transport/include/asr/backend/api_service.hpp](../src/backend/transport/include/asr/backend/api_service.hpp) | ApiService job/callback/public REST interface and in-memory job ownership. |
+| [src/backend/transport/src/api_service.cpp](../src/backend/transport/src/api_service.cpp) | Routes REST requests, creates async jobs, handles idempotency/cancellation/status and serves allowlisted artifacts. |
+| [src/backend/transport/include/asr/backend/service_gate.hpp](../src/backend/transport/include/asr/backend/service_gate.hpp) | Live-versus-suite admission gate. It bounds competing service workloads, not the decoder turn order. |
+
+### C++ PCM simulation used by actual CLI/REST requests
+
+| File | What to read / responsibility |
+|---|---|
+| [src/benchmark/include/asr/benchmark/baseline.hpp](../src/benchmark/include/asr/benchmark/baseline.hpp) | Single-call runner contract; real sessions use run_baseline regardless of directory name. |
+| [src/benchmark/src/baseline.cpp](../src/benchmark/src/baseline.cpp) | Creates a real call, paces PCM, invokes submit/EOF, receives events through RepositorySink and persists call artifacts/measurements. |
+| [src/benchmark/include/asr/benchmark/load.hpp](../src/benchmark/include/asr/benchmark/load.hpp) | LoadWavInput, LoadSpec, LoadCall/LoadPlan, manifest preparation and multi-call runner contracts. |
+| [src/benchmark/src/load.cpp](../src/benchmark/src/load.cpp) | Prepares/manages manifests, selects recordings/languages, plans IDs, performs admission estimates and runs concurrent producer threads against any IASREngine. |
+| [src/benchmark/include/asr/benchmark/sweep.hpp](../src/benchmark/include/asr/benchmark/sweep.hpp) | Optional public CLI/REST configuration-axis planning contracts. |
+| [src/benchmark/src/sweep.cpp](../src/benchmark/src/sweep.cpp) | Optional production command dispatch for configuration cases. Not needed to follow one live call; included because it is part of the user-facing CLI. |
+
+### Configuration, measurement and storage
+
+| File | What to read / responsibility |
+|---|---|
+| [src/config/include/asr/config/config.hpp](../src/config/include/asr/config/config.hpp) | RunConfig values/defaults and resolve_config declaration. |
+| [src/config/src/config.cpp](../src/config/src/config.cpp) | Strict defaults/YAML/override merge, validation, path resolution and resolved configuration metadata. |
+| [src/observability/include/asr/observability/metrics.hpp](../src/observability/include/asr/observability/metrics.hpp) | CallMeasurements, event serialization helpers and measurement summary contracts. |
+| [src/observability/src/metrics.cpp](../src/observability/src/metrics.cpp) | Derives first/final/EOF/queue/decode metrics and streaming counters from captured boundaries; does not perform inference. |
+| [src/observability/include/asr/observability/system_sampler.hpp](../src/observability/include/asr/observability/system_sampler.hpp) | ISystemSampler, LinuxSystemSampler and ResourceMonitor interfaces. |
+| [src/observability/src/system_sampler.cpp](../src/observability/src/system_sampler.cpp) | Samples host/process-tree CPU, memory and process information; accumulates resource summaries on a monitor thread. |
+| [src/storage/include/asr/storage/repository.hpp](../src/storage/include/asr/storage/repository.hpp) | IResultRepository/FileResultRepository and event/environment/ID helper declarations. In-memory helpers are not the real-call artifact path. |
+| [src/storage/src/repository.cpp](../src/storage/src/repository.cpp) | Generates run IDs, writes configuration/events/audio/runtime records and final summary/status in per-run directories. |
+
+### Browser application
+
+| File | What to read / responsibility |
+|---|---|
+| [frontend/src/main.tsx](../frontend/src/main.tsx) | Mounts the React app in the page. |
+| [frontend/src/App.tsx](../frontend/src/App.tsx) | Owns service-origin/capability/config/runtime state and coordinates visible panels. |
+| [frontend/src/api.ts](../frontend/src/api.ts) | REST calls, capability/response types and WebSocket URL construction. |
+| [frontend/src/types.ts](../frontend/src/types.ts) | Dashboard history/job/event/result type declarations. |
+| [frontend/src/wav.ts](../frontend/src/wav.ts) | Browser WAV parsing/validation and PCM chunk extraction. |
+| [frontend/src/stream.ts](../frontend/src/stream.ts) | PacedStream: UUID identities, WebSocket lifecycle, credit-based PCM pacing, EOF/cancel, revision deduplication and arrival metrics. |
+| [frontend/src/accuracy.ts](../frontend/src/accuracy.ts) | Reference normalization and browser WER/CER calculation; independent of model decoding. |
+| [frontend/src/metrics.ts](../frontend/src/metrics.ts) | Dashboard display/interpretation helpers for measurement fields. |
+| [frontend/src/styles.css](../frontend/src/styles.css) | Dashboard layout/visual styling. |
+| [frontend/src/components/StreamingPanel.tsx](../frontend/src/components/StreamingPanel.tsx) | Interactive real PCM upload/controls, stream state, transcript history and arrival/reference metrics. |
+| [frontend/src/components/ExperimentPanel.tsx](../frontend/src/components/ExperimentPanel.tsx) | Submits C++ service suite jobs and exposes validated overrides; it does not infer audio in JavaScript. |
+| [frontend/src/components/RuntimePanel.tsx](../frontend/src/components/RuntimePanel.tsx) | Displays worker health, active sessions, queues/thread/resource state. |
+| [frontend/src/components/HistoryPanel.tsx](../frontend/src/components/HistoryPanel.tsx) | Fetches recorded suites/calls/artifacts and displays completed-run information. |
+| [frontend/src/components/LogPanel.tsx](../frontend/src/components/LogPanel.tsx) | Displays dashboard messages and transport/service errors. |
+
+### Build, acquisition and active configuration
+
+| File | What to read / responsibility |
+|---|---|
+| [CMakeLists.txt](../CMakeLists.txt) | Project language/options, module inclusion and production/test target separation; ASR_BUILD_TESTS=OFF excludes test targets. |
+| [CMakePresets.json](../CMakePresets.json) | Release CPU build location/options; use a separate custom directory for CPU debugging. |
+| [cmake/CoreLibraries.cmake](../cmake/CoreLibraries.cmake) | Wires runtime-independent libraries and asr-cli. Follow the actual CPU/transport/storage dependencies when reading this file. |
+| [cmake/FoundationDependencies.cmake](../cmake/FoundationDependencies.cmake) | Pinned YAML/JSON dependency lookup/fetch integration. |
+| [cmake/NativeQwen.cmake](../cmake/NativeQwen.cmake) | Pins/validates native source, generates guarded/resumable CPU copy and builds qwen_cpu/OpenBLAS with explicit native optimization flags. |
+| [cmake/RuntimeTargets.cmake](../cmake/RuntimeTargets.cmake) | Builds native/shared engine libraries and helper executables, linking them into asr-cli. |
+| [configs/qwen_stream_shared.yaml](../configs/qwen_stream_shared.yaml) | Primary resumable shared preset: model/thread/decode/worker/audio/output settings. |
+| [configs/qwen_native_single.yaml](../configs/qwen_native_single.yaml) | Retained isolated native preset; different active-call ownership. |
+| [configs/qwen_prefix_shared.yaml](../configs/qwen_prefix_shared.yaml) | Retained prefix/EOF preset; different text/finalization policy. |
+| [scripts/setup.py](../scripts/setup.py) | Acquires missing pinned assets and orchestrates production C++/frontend builds/selected cleanup. |
+| [scripts/doctor.py](../scripts/doctor.py) | Checks local prerequisites/environment needed to run the production code. |
+| [scripts/fetch_foundation.sh](../scripts/fetch_foundation.sh) | Obtains pinned YAML/JSON dependencies. |
+| [scripts/fetch_native.sh](../scripts/fetch_native.sh) | Obtains pinned CPU native source/model assets and supporting prerequisites. |
+| [scripts/prepare_qwen_guard.py](../scripts/prepare_qwen_guard.py) | Build-time vendor-copy/guard generation; invokes resumable source preparation. |
+| [scripts/prepare_qwen_stream.py](../scripts/prepare_qwen_stream.py) | Generates persistent per-call native state and the one-quantum API from exact pinned source anchors. |
+| [frontend/index.html](../frontend/index.html) | Browser document/root entry for the frontend. |
+| [frontend/vite.config.ts](../frontend/vite.config.ts) | Frontend build/development-server settings. |
+| [frontend/tsconfig.json](../frontend/tsconfig.json) | TypeScript compilation settings. |
+| [frontend/package.json](../frontend/package.json) | Frontend dependency versions and build/run scripts. |
+| [frontend/package-lock.json](../frontend/package-lock.json) | Exact frontend package resolution. |
+| [third_party/revisions.lock](../third_party/revisions.lock) | Native/model/foundation revision and artifact identity records. |
+
+### CPU model implementation actually compiled
+
+`cmake/NativeQwen.cmake` generates `build/<build-name>/qwen_guarded_cpu/` from pinned vendor source and compiles that generated copy. Debug the generated copy when examining `qwen_resumable_*`; those functions do not exist in the pristine vendor checkout.
+
+| Vendor file | Responsibility |
+|---|---|
+| `qwen_asr.h` | Public native context/configuration, callbacks and inference API; generated header additionally declares qwen_resumable state/API. |
+| `qwen_asr.c` | Model lifecycle and native inference/streaming orchestration; generated copy contains resumable creation/step/destruction and cooperative guard hooks. |
+| `qwen_asr_audio.h` | Audio feature/mel interface and audio-related declarations. |
+| `qwen_asr_audio.c` | PCM feature extraction and audio preprocessing consumed by encoder orchestration. |
+| `qwen_asr_encoder.c` | Encoder weight loading and windowed audio encoder computation. |
+| `qwen_asr_decoder.c` | Decoder weights, prefill/KV and token-forward computation. |
+| `qwen_asr_tokenizer.h` | Native tokenizer type and token/text conversion declarations. |
+| `qwen_asr_tokenizer.c` | Tokenizer loading, encoding/decoding and text-token lookup. |
+| `qwen_asr_safetensors.h` | Weight-file mapping/index types and loading interface. |
+| `qwen_asr_safetensors.c` | Reads/maps safetensor weights and exposes tensors to encoder/decoder. |
+| `qwen_asr_kernels.h` | Numerical kernel API and CPU thread control declarations. |
+| `qwen_asr_kernels.c` | Kernel dispatch/runtime support used by encoder/decoder and BLAS-enabled CPU execution. |
+| `qwen_asr_kernels_impl.h` | Shared implementation/template helpers used by kernel variants. |
+| `qwen_asr_kernels_generic.c` | Portable CPU kernel implementation. |
+| `qwen_asr_kernels_avx.c` | x86 AVX-specialized kernels relevant to this machine. |
+| `qwen_asr_kernels_neon.c` | ARM NEON specialization, compiled conditionally; not the x86 hot path. |
+
+Third-party YAML/JSON implementation trees and OS/OpenBLAS libraries are dependencies, not custom application modules. Their pins are in `third_party/revisions.lock`; following every dependency internal is unnecessary to understand application routing. GPU sources and vendor demo programs are not part of this guide.
+
+## 12. Build and run
+
+Run commands from the repository root. Model/data assets must be present; setup can acquire pinned missing assets.
+
+```bash
+python3 scripts/setup.py --frontend --with-data
+cmake --preset release-cpu
+cmake --build --preset release-cpu
+```
+
+Build only production targets when iterating:
+
+```bash
+cmake --build --preset release-cpu --target asr-cli asr-prefix-worker asr-native-worker
+```
+
+### 12.1. One worker, shared state and up to two sessions
+
+```bash
+build/release-cpu/asr-cli serve \
+  --config configs/qwen_stream_shared.yaml \
+  --manifest datasets/manifests/demo_calls.jsonl \
+  --set workers.processes=1 \
+  --set workers.max_sessions_per_process=2 \
+  --port 8081
+```
+
+### 12.2. Two workers, two sessions each
+
+```bash
+build/release-cpu/asr-cli serve \
+  --config configs/qwen_stream_shared.yaml \
+  --manifest datasets/manifests/demo_calls.jsonl \
+  --set workers.processes=2 \
+  --set workers.max_sessions_per_process=2 \
+  --port 8081
+```
+
+In another terminal:
+
+```bash
+cd frontend
+npm run dev
+```
+
+Browser: `http://127.0.0.1:5173`; service origin: `http://127.0.0.1:8081`. If that port is occupied, choose a free port such as 8082 and use the same origin in the dashboard.
+
+### 12.3. Real WAV simulation without the browser
+
+This command creates its own engine and four total calls, with at most four active producer sessions:
+
+```bash
+build/release-cpu/asr-cli load \
+  --config configs/qwen_stream_shared.yaml \
+  --manifest datasets/manifests/demo_calls.jsonl \
+  --set workers.processes=2 \
+  --set workers.max_sessions_per_process=2 \
+  --calls 4 --concurrency 4 --languages en,id,zh --mode direct
+```
+
+Replace `direct` with `network` to insert the private WebSocket listener/client adapter. It still owns its engine, rather than sending a job to your separate UI server.
+
+For an existing server, request the C++ simulator through REST:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8081/v1/suites \
+  -H 'Content-Type: application/json' \
+  -d '{"kind":"load","mode":"direct","calls":4,"concurrency":4,"languages":["en","id","zh"]}'
+```
+
+The server must have enough configured slots. `calls` is total work; `concurrency` is active simulated sessions. Neither changes `workers.processes`. An idempotent/overload API response can reject a job before inference; inspect returned status.
+
+Configuration precedence is defaults → YAML → explicit overrides. For this runtime, relevant knobs are `model.decode_step_ms`, `audio.chunk_ms`, `model.threads`, `workers.processes`, `workers.max_sessions_per_process`, `workers.scheduler`, token/withholding/refinement and deadlines. CPU power/thermal settings affect elapsed time but do not select model/session identity.
+
+## 13. Follow a real call in a debugger
+
+### 13.1. Build a separate CPU debug directory
+
+```bash
+cmake -S . -B build/debug-cpu -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DASR_ENABLE_QWEN_NATIVE=ON \
+  -DASR_BUILD_TESTS=OFF
+cmake --build build/debug-cpu --target asr-cli asr-prefix-worker asr-native-worker -j 4
+```
+
+This enables C/C++ debug information and readable application frames. **The native target explicitly adds `-O3` in `NativeQwen.cmake`, even in a Debug build.** Native locals may therefore be optimized away/inlined. Prefer breakpoints at `qwen_resumable_*` and inspect persistent heap state; full instruction-by-instruction unoptimized native work needs a deliberate debug-only native compile-option change. Do not modify the release target merely to make stepping convenient.
+
+Debugger pauses distort pacing and monotonic deadlines. Use a throwaway output directory and generous validated debug-only lag/time limits; those timings are not benchmark evidence. Do not stop a child at boot for more than its parent's fixed 120-second boot wait.
+
+### 13.2. First walkthrough: one real call, one in-process worker
+
+```bash
+gdb --args build/debug-cpu/asr-cli load \
+  --config configs/qwen_stream_shared.yaml \
+  --manifest datasets/manifests/demo_calls.jsonl \
+  --set workers.processes=1 --set workers.max_sessions_per_process=2 \
+  --set model.timeout_ms=600000 \
+  --set workers.idle_timeout_ms=600000 --set workers.total_timeout_ms=600000 \
+  --set audio.max_lag_ms=60000 --set audio.queue_max_ms=60000 \
+  --set audio.queue_max_bytes=1920000 --set audio.queue_max_chunks=10000 \
+  --set output.directory=../results/debug-call \
+  --calls 1 --concurrency 1 --languages en --mode direct
+```
+
+Useful GDB commands:
+
+```gdb
+set pagination off
+set print pretty on
+set breakpoint pending on
+break asr::app::make_engine
+break asr::PrefixMultiplexEngine::create_session
+break asr::PrefixShared::select
+break qwen_resumable_create
+break qwen_resumable_step
+run
+```
+
+At `make_engine`:
+
+```gdb
+print config.runtime
+print config.worker_processes
+print config.max_sessions_per_process
+bt
+```
+
+At `create_session`:
+
+```gdb
+print config.run_id
+print config.call_id
+print config.language
+print config.decode_step_ms
+```
+
+At `select`, step through construction of the `ready` vector. Inspect `calls`, each call's `decoded_samples`, `audio`, `step_ready_ns`, `eof` and `busy`. Do not expect a useful local before its assignment has executed.
+
+At native `qwen_resumable_step`:
+
+```gdb
+print n_samples
+print eof
+print s->audio_cursor
+print s->chunk_idx
+print s->ctx->stream_chunk_sec
+bt
+```
+
+The number of samples supplied is cumulative up to this quantum, while `audio_cursor` records already processed progress. An already-existing `s` demonstrates resumption rather than construction of a new decoder every chunk. Two calls should have different state pointers while their parent/shared weight owner is the same worker.
+
+To inspect different threads:
+
+```gdb
+info threads
+thread apply all bt 6
+thread <number>
+bt
+continue
+```
+
+GDB normally stops all threads; media deadlines continue to advance in wall time. Stepping a producer thread will not show the inference loop on the same stack. The sink callback runs in the inference/reader thread, not necessarily the original submitting thread. Avoid scheduler locking when another thread must supply an acknowledgement or release a wait.
+
+### 13.3. Observe actual multiplexing
+
+Use the same debug command with `--calls 2 --concurrency 2`. Both calls use one worker/two slots. Break at `qwen_resumable_step` and compare `s` pointers/cursors across invocations. Break in `PrefixShared::select` to see which call is chosen. A quantum may finish before another call is ready; the sequence need not be a perfectly alternating A,B,A,B at every timestamp.
+
+Watch selection timestamps and readiness, not just arrival order. A call with insufficient audio is skipped until ready. Expiry has precedence; no language or user-visible priority rank is injected by the UI.
+
+### 13.4. Follow a child process
+
+Start the debug `serve` command with two workers. Pool construction starts children before the listener reports ready. For startup tracing:
+
+```gdb
+set follow-fork-mode child
+set detach-on-fork off
+set schedule-multiple on
+catch vfork
+catch exec
+break asr::PrefixProcessPool::create_session
+run
+info inferiors
+```
+
+`posix_spawn` may use a vfork/clone implementation; exact stops vary with libc/GDB. The reliable alternative is to let startup finish, read child PIDs from `/v1/runtime`, and attach a second debugger to a worker:
+
+```bash
+curl -sS http://127.0.0.1:8081/v1/runtime
+# Use a reported worker process_id, not the coordinating service PID.
+gdb -p <worker-process-id>
+```
+
+In the worker debugger:
+
+```gdb
+break asr::PrefixMultiplexEngine::create_session
+break qwen_resumable_step
+continue
+```
+
+In the controller debugger, observe `PrefixProcessPool::create_session` and `PrefixProcess::rpc`. The model's `qwen_resumable_step` executes in the worker, so a breakpoint set only in the controller cannot show that child's stack. `info inferiors`/`inferior <number>` selects the process; `info threads` selects its thread.
+
+Attaching depends on the host's ptrace permissions. A permission error is an OS debugger-access issue, not an ASR failure. Use a permitted debugger session rather than changing unrelated system policy.
+
+### 13.5. Follow a live WebSocket call
+
+Run debug `serve` with one worker/two slots and connect the browser. Add a breakpoint at `asr::WebSocketServer::handle_client`, or use the file-line landmarks below to stop after the `start` JSON has been parsed.
+
+Inspect `config.run_id`, `config.call_id`, `message`, `sequence`, `first`, `count` and `frame.payload.size()` in their respective scopes. Follow `session->submit` into the shared session. Switch to the inference thread to inspect model progress. At `ServerSink::on_event`, inspect the produced `RecognitionEvent`, then compare it with the browser revision.
+
+The caller's chunk `sequence` and the event `sequence` are separate counters; their numbers need not match. A result's `consumed_samples` is the decoding watermark, while acknowledgements refer to media accepted by `submit`.
+
+### 13.6. Source-line landmarks
+
+These line numbers are generated from the source present when this guide was written. Function names remain the better reference after edits. `break path:line` is useful for anonymous helper classes or optimized inline functions. Headers/source links open the correct file; the table gives the line for GDB.
+
+| File | Line | Landmark |
+|---|---:|---|
+| [apps/asr_cli/engine_runtime.cpp](../apps/asr_cli/engine_runtime.cpp) | 34 | Runtime factory |
+| [apps/asr_cli/service.cpp](../apps/asr_cli/service.cpp) | 20 | Service startup |
+| [src/benchmark/src/load.cpp](../src/benchmark/src/load.cpp) | 325 | Real call producer threads |
+| [src/benchmark/src/baseline.cpp](../src/benchmark/src/baseline.cpp) | 52 | Single-call PCM lifecycle |
+| [src/engines/prefix/src/prefix_pool.cpp](../src/engines/prefix/src/prefix_pool.cpp) | 40 | Child spawn/socket setup |
+| [src/engines/prefix/src/prefix_pool.cpp](../src/engines/prefix/src/prefix_pool.cpp) | 381 | Shared worker admission |
+| [src/engines/prefix/src/prefix_pool.cpp](../src/engines/prefix/src/prefix_pool.cpp) | 207 | IPC request/reply correlation |
+| [src/engines/prefix/src/prefix_pool.cpp](../src/engines/prefix/src/prefix_pool.cpp) | 154 | Child event demultiplexing |
+| [src/engines/prefix/src/prefix_engine.cpp](../src/engines/prefix/src/prefix_engine.cpp) | 178 | Ready-call selection |
+| [src/engines/prefix/src/prefix_engine.cpp](../src/engines/prefix/src/prefix_engine.cpp) | 226 | Inference thread loop |
+| [src/engines/prefix/src/prefix_engine.cpp](../src/engines/prefix/src/prefix_engine.cpp) | 279 | Native step invocation |
+| [src/engines/prefix/src/prefix_engine.cpp](../src/engines/prefix/src/prefix_engine.cpp) | 446 | PCM validation / readiness |
+| [src/engines/prefix/src/prefix_engine.cpp](../src/engines/prefix/src/prefix_engine.cpp) | 474 | EOF wait |
+| [src/backend/transport/src/websocket.cpp](../src/backend/transport/src/websocket.cpp) | 672 | Live connection handler |
+| [src/backend/transport/src/websocket.cpp](../src/backend/transport/src/websocket.cpp) | 754 | Start metadata parsing |
+| [apps/asr_prefix_worker/main.cpp](../apps/asr_prefix_worker/main.cpp) | 55 | Child command ingress |
+
+For example, `rbreak PrefixSession::submit` or `rbreak ServerSink::on_event` can find anonymous-namespace methods. There are two `RemoteSession` classes: one in `prefix_pool.cpp`, one in `websocket.cpp`; use a file-line breakpoint to disambiguate them.
+
+### 13.7. What to inspect when something looks wrong
+
+| Symptom | First locations / evidence |
+|---|---|
+| A new call is rejected despite final text | pool parent call map, remote session destructor, child `drop`, actual reserved slots |
+| PCM acknowledgement is slow | WebSocket reader/ack wait, local IPC `rpc(audio)`, shared mutex; acknowledgement is not model completion |
+| No first text yet | audio vs cursor/step readiness; inference turn; native text empty/UTF-8 incomplete; sink delivery |
+| EOF delay is large | received samples minus decoded cursor, queued turns, step durations, optional final refinement |
+| Wrong language/text in another call | run/call IDs in start/PCM/events; parent call map and private native state pointers |
+| Model breakpoints never hit | selected runtime, current process/inferior, generated CPU source rather than pristine vendor source |
+| All samples arrived but no successful final | EOF expected count/sequence, finish wait, event status, sink exception |
+| Reported CPU exceeds worker thread count | sampled process tree includes controller/producer/socket threads; compute-thread budget is not an OS core cap |
+
+## 14. Reading paths and common mistakes
+
+### Beginner: first hour
+
+1. Read Sections 1–2 and `core/types.hpp`.
+2. Read `engine.hpp`: only five call-facing operations need to make sense initially.
+3. Read `make_engine()` to see exactly which path your YAML selects.
+4. Read `run_baseline()` to understand submit → EOF → result.
+5. Read `PrefixSession::submit()` before the model's numerical internals.
+
+### Intermediate: understand concurrency
+
+1. Read `PrefixProcessPool::create_session()` and reservation cleanup.
+2. Read `PrefixShared::select()` and `prefix_scheduler.hpp` together.
+3. Read `PrefixShared::loop()` and see where the mutex is released.
+4. Read worker `main.cpp`, `rpc()` and `read_loop()`; separate requests from events.
+5. Trace one call ID across all of those boundaries.
+
+### Advanced: understand compute and measurement
+
+1. Read `prepare_qwen_stream.py` and the generated state definition.
+2. Inspect `qwen_resumable_step` and encoder-window/prefill reuse.
+3. Inspect decoder prefill/token generation and CPU kernels.
+4. Inspect sink timestamp boundaries and `CallMeasurements` summaries.
+5. Compare per-call cursor, ready time, job wall duration and input pacing; averages alone cannot explain backlog.
+
+| Misreading | Correct interpretation |
+|---|---|
+| `--concurrency 4` means four model processes | It limits active simulated calls; worker process count is configured separately |
+| Two workers/two slots means only two calls | It permits four sessions, with two worker jobs computing at most |
+| Model IDs are derived from call IDs | Model is a startup resource; call IDs route independent state/results |
+| The generic `scheduler.cpp` controls resumable priority | Shared worker routing is in the pool; ready-step priority is inside the shared engine |
+| Direct means no sockets anywhere | Multi-worker direct mode still uses Unix worker IPC |
+| Network load automatically targets the existing UI listener | CLI load owns a private listener; REST suites reuse engine but create an internal network adapter |
+| Ack means a transcript was computed | Ack confirms PCM was accepted; decoding runs asynchronously |
+| Final text means slot already free | Ownership/destruction/drop releases the slot after finalization |
+| Every 100 ms audio chunk produces text | Model readiness follows decode-step/sample boundaries and compute capacity |
+| Resumable means every encoder operation is incremental | Completed-window/prefill caches are reused; growing windows can be recomputed |
+| More threads guarantee lower latency | Actual performance depends on kernels, contention, clocks, thermal/power configuration and workload |
+
+The main source-reading question is always: **which object owns this call now, which thread/process is running, and which ID carries it across the next boundary?** Answering those three questions makes the rest of the code navigable.
